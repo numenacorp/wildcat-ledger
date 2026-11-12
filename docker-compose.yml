@@ -1,106 +1,107 @@
-# WARNING!
-# This is a development version of THE Bigcapital docker-compose.yml file.
-# Avoid using this file in your production environment.
-# We're exposing here sensitive ports and mounting code volumes for rapid development and debugging of the server stack.
+# Local stack for development and for CI.
+#
+#   docker compose up -d                    MariaDB, Redis, Gotenberg, an S3 stand-in
+#   docker compose --profile server up -d   the same, plus the server built from this tree
+#
+# Host ports are set high so they do not collide with other local stacks.
+# Override any of them from the environment.
 
-version: '3.3'
+name: ledger
 
 services:
   mariadb:
-    build:
-      context: ./docker/mariadb
+    image: mariadb:${MARIADB_VERSION:-11.8}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=500
     environment:
-      - MYSQL_DATABASE=${SYSTEM_DB_NAME}
-      - MYSQL_USER=${DB_USER}
-      - MYSQL_PASSWORD=${DB_PASSWORD}
-      - MYSQL_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      MARIADB_DATABASE: ${SYSTEM_DB_NAME:-bigcapital_system}
     volumes:
-      - mysql:/var/lib/mysql
-    expose:
-      - '3306'
+      - mariadb:/var/lib/mysql
     ports:
-      - '3306:3306'
-    deploy:
-      restart_policy:
-        condition: unless-stopped
+      - '127.0.0.1:${MARIADB_HOST_PORT:-33306}:3306'
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   redis:
-    build:
-      context: ./docker/redis
-    expose:
-      - '6379'
+    image: redis:7-alpine
     ports:
-      - '6379:6379'
-    volumes:
-      - redis:/data
-    deploy:
-      restart_policy:
-        condition: unless-stopped
+      - '127.0.0.1:${REDIS_HOST_PORT:-36379}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # A second Redis for test runs. Every process on one Redis shares the job
+  # queues, so tests get their own and cannot take a running server's jobs.
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - '127.0.0.1:${REDIS_TEST_HOST_PORT:-36380}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   gotenberg:
     image: gotenberg/gotenberg:7
+    # The converter fetches the page to print from the server. When the server
+    # runs on the host (scripts/local-up.sh) it reaches it by this name.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     ports:
-      - '9000:3000'
+      - '127.0.0.1:${GOTENBERG_HOST_PORT:-39100}:3000'
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+  # An S3-compatible store for local runs and CI. It accepts any credentials
+  # and does not check signatures: a stand-in, not a deployment option.
+  s3:
+    image: adobe/s3mock:${S3MOCK_VERSION:-latest}
     environment:
-      # With an empty password, the image entrypoint restricts the
-      # `default` user to localhost connections only, which would reject
-      # connections through the published port. Setting the entrypoint's
-      # CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT input routes to the
-      # unrestricted user setup instead. Set a non-empty
-      # CLICKHOUSE_PASSWORD in .env to protect the user in production.
-      - CLICKHOUSE_USER=${CLICKHOUSE_USER:-default}
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=${CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT:-1}
-      - CLICKHOUSE_DB=${CLICKHOUSE_DATABASE:-bigcapital_analytics}
-    expose:
-      - '8123'
-      - '9000'
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: ${S3_BUCKET:-ledger}
     ports:
-      - '8123:8123'
-    volumes:
-      - clickhouse:/var/lib/clickhouse
-    deploy:
-      restart_policy:
-        condition: unless-stopped
+      - '127.0.0.1:${S3_HOST_PORT:-39000}:9090'
 
-  garage:
-    image: dxflrs/garage:v1.3.1
-    container_name: bigcapital-garage
+  server:
+    profiles: ['server']
+    build:
+      context: .
+      dockerfile: packages/server/Dockerfile
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      - GARAGE_CONFIG_FILE=/etc/garage.toml
-      - GARAGE_RPC_SECRET=${GARAGE_RPC_SECRET}
-      - GARAGE_ADMIN_TOKEN=${GARAGE_ADMIN_TOKEN}
-    volumes:
-      - ./docker/garage/garage.toml:/etc/garage.toml
-      - ./docker/garage/setup.sh:/garage-setup/setup.sh
-      - garage:/var/lib/garage
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      SYSTEM_DB_NAME: ${SYSTEM_DB_NAME:-bigcapital_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_HOST: redis
+      QUEUE_PORT: 6379
+      APP_JWT_SECRET: ${APP_JWT_SECRET:-local-dev-jwt-secret}
+      BASE_URL: http://localhost:${SERVER_HOST_PORT:-13000}
+      SIGNUP_DISABLED: 'false'
+      SIGNUP_EMAIL_CONFIRMATION: 'false'
+      GOTENBERG_URL: http://gotenberg:3000
+      GOTENBERG_DOCS_URL: http://server:3000/public/
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://s3:9090
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-ledger-local}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-ledger-local-secret}
+      S3_BUCKET: ${S3_BUCKET:-ledger}
+      S3_FORCE_PATH_STYLE: 'true'
     ports:
-      - '3900:3900'
-      - '3903:3903'
-    expose:
-      - '3900'
-      - '3903'
-    deploy:
-      restart_policy:
-        condition: unless-stopped
+      - '127.0.0.1:${SERVER_HOST_PORT:-13000}:3000'
 
-# Volumes
 volumes:
-  mysql:
-    name: bigcapital_dev_mysql
-    driver: local
-
-  redis:
-    name: bigcapital_dev_redis
-    driver: local
-
-  garage:
-    name: bigcapital_dev_garage
-    driver: local
-
-  clickhouse:
-    name: bigcapital_dev_clickhouse
-    driver: local
+  mariadb:

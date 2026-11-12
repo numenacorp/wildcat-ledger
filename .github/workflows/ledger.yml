@@ -1,0 +1,91 @@
+name: Ledger
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  terms:
+    name: Terms check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18.16.1
+      # The list of terms is kept outside the repository.
+      - name: Check this fork's files
+        env:
+          TERMS: ${{ secrets.LEDGER_TERMS }}
+        run: node scripts/check-terms.mjs
+
+  tests:
+    name: Ledger tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18.16.1
+          cache: pnpm
+
+      - name: Start the local stack
+        run: docker compose up -d --wait mariadb redis redis-test
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages and server
+        run: pnpm build:server
+
+      - name: Create server .env file
+        run: |
+          cat > packages/server/.env << EOF
+          DB_HOST=127.0.0.1
+          DB_PORT=33306
+          DB_USER=root
+          DB_PASSWORD=root
+          SYSTEM_DB_NAME=bigcapital_system
+          TENANT_DB_NAME_PERFIX=bigcapital_tenant_
+          BASE_URL=http://localhost:3000
+          APP_JWT_SECRET=test-app-jwt-secret
+          SIGNUP_DISABLED=false
+          SIGNUP_EMAIL_CONFIRMATION=false
+          REDIS_HOST=127.0.0.1
+          REDIS_PORT=36379
+          QUEUE_HOST=127.0.0.1
+          QUEUE_PORT=36379
+          S3_REGION=us-east-1
+          S3_ACCESS_KEY_ID=test-access-key
+          S3_SECRET_ACCESS_KEY=test-secret-key
+          S3_ENDPOINT=http://127.0.0.1:39000
+          S3_BUCKET=test-bucket
+          MAIL_HOST=localhost
+          MAIL_PORT=1025
+          MAIL_FROM_NAME=Ledger
+          MAIL_FROM_ADDRESS=test@example.com
+          EOF
+
+      - name: Run system migrations
+        run: pnpm system:migrate:latest
+
+      - name: Unit tests of the extension
+        run: pnpm --filter @bigcapital/server exec jest src/modules/LedgerExt
+
+      - name: API tests of the extension
+        run: pnpm --filter @bigcapital/server exec jest --config ./test/jest-e2e.json --forceExit test/ledger
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144

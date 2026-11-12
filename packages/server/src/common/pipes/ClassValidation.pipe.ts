@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
+import { isStrictDto } from '@/common/decorators/StrictDto';
 
 @Injectable()
 export class ValidationPipe implements PipeTransform<any> {
@@ -17,6 +18,8 @@ export class ValidationPipe implements PipeTransform<any> {
     const errors = await validate(object, {
       // Strip validated object of any properties that do not have any decorators.
       whitelist: true,
+      // A DTO marked strict refuses the request instead.
+      forbidNonWhitelisted: isStrictDto(metatype),
     });
 
     if (errors.length > 0) {

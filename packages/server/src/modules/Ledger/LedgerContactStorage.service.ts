@@ -46,10 +46,18 @@ export class LedgerContactsBalanceStorage {
     );
     const effectedContactsIds = balanceLedger.getContactsIds();
 
-    effectedContactsIds.forEach((contactId: number) => {
-      saveContactsBalanceQueue.push({ contactId, ledger: balanceLedger, trx });
-    });
-    if (effectedContactsIds.length > 0) await saveContactsBalanceQueue.drain();
+    // Each task is awaited, so that one that fails, a deadlock among them,
+    // fails the write. Pushed and merely drained, the failure went unseen
+    // and the write carried on in a transaction already rolled back.
+    await Promise.all(
+      effectedContactsIds.map((contactId: number) =>
+        saveContactsBalanceQueue.pushAsync({
+          contactId,
+          ledger: balanceLedger,
+          trx,
+        }),
+      ),
+    );
   };
 
   /**

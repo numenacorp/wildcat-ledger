@@ -13,4 +13,7 @@ test-results/
 e2e/.auth/
 
 
-.pnpm-store
+.pnpm-store.local/
+
+# Local run state and credentials (scripts/local-up.sh)
+/.local/

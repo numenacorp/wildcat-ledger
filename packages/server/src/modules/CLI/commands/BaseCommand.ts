@@ -20,7 +20,8 @@ export abstract class BaseCommand extends CommandRunner {
         user: this.configService.get('systemDatabase.user'),
         password: this.configService.get('systemDatabase.password'),
         database: this.configService.get('systemDatabase.databaseName'),
-        charset: 'utf8',
+        charset: this.configService.get('systemDatabase.charset'),
+        ssl: this.configService.get<any>('systemDatabase.ssl'),
         ...DATE_ONLY_COLUMNS_OPTIONS,
       },
       migrations: {
@@ -44,7 +45,8 @@ export abstract class BaseCommand extends CommandRunner {
         user: this.configService.get('tenantDatabase.user'),
         password: this.configService.get('tenantDatabase.password'),
         database: `${this.configService.get('tenantDatabase.dbNamePrefix')}${organizationId}`,
-        charset: 'utf8',
+        charset: this.configService.get('tenantDatabase.charset'),
+        ssl: this.configService.get<any>('tenantDatabase.ssl'),
         ...DATE_ONLY_COLUMNS_OPTIONS,
       },
       migrations: {

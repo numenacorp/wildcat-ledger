@@ -1,21 +1,16 @@
 {
-  "name": "bigcapital-monorepo",
+  "name": "ledger",
   "private": true,
   "scripts": {
     "dev": "lerna run dev",
     "build": "lerna run build",
     "typecheck": "lerna run typecheck",
-    "dev:webapp": "lerna run dev --scope \"@bigcapital/webapp\" --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\"",
-    "build:webapp": "lerna run build --scope \"@bigcapital/webapp\" --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\" --scope \"@bigcapital/sdk-ts\"",
     "dev:server": "lerna run dev --scope \"@bigcapital/server\" --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\" --scope \"@bigcapital/email-components\"",
-    "build:shared": "lerna run build --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\" --scope \"@bigcapital/email-components\" --scope \"@bigcapital/sdk-ts\"",
+    "build:shared": "lerna run build --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\" --scope \"@bigcapital/email-components\"",
     "build:server": "lerna run build --scope \"@bigcapital/server\" --scope \"@bigcapital/utils\" --scope \"@bigcapital/pdf-templates\" --scope \"@bigcapital/email-components\"",
     "test:watch": "lerna run test:watch",
     "test:e2e": "lerna run test:e2e --scope \"@bigcapital/server\"",
-    "e2e:webapp": "playwright test",
-    "screenshot:webapp": "playwright test --config playwright.screenshots.config.ts",
     "dev:debug": "lerna run dev:debug",
-    "prepare": "husky install",
     "system:migrate:make": "lerna run cli:system:migrate:make --scope \"@bigcapital/server\"",
     "tenants:migrate:make": "lerna run cli:tenants:migrate:make --scope \"@bigcapital/server\"",
     "system:migrate:rollback": "lerna run cli:system:migrate:rollback --scope \"@bigcapital/server\"",
@@ -24,30 +19,18 @@
     "tenants:migrate:latest": "lerna run cli:tenants:migrate:latest --scope \"@bigcapital/server\"",
     "system:seed:latest": "lerna run cli:system:seed:latest --scope \"@bigcapital/server\"",
     "tenants:seed:latest": "lerna run cli:tenants:seed:latest --scope \"@bigcapital/server\"",
-    "generate:sdk-types": "lerna run openapi:export --scope \"@bigcapital/server\" && lerna run generate --scope \"@bigcapital/sdk-ts\" && lerna run build --scope \"@bigcapital/sdk-ts\"",
-    "stripe:sync-plans": "lerna run cli:stripe:sync-plans --scope \"@bigcapital/server\"",
     "format": "lerna run format",
     "format:check": "lerna run format:check",
     "lint": "lerna run lint",
     "lint:check": "lerna run lint:check"
   },
   "devDependencies": {
-    "@commitlint/cli": "^17.4.2",
-    "@commitlint/config-conventional": "^17.4.2",
-    "@commitlint/config-lerna-scopes": "^17.4.2",
     "@faker-js/faker": "^8.0.2",
-    "@playwright/test": "^1.32.3",
-    "husky": "^8.0.3",
     "lerna": "^8.1.2",
     "pnpm": "^9.0.5"
   },
   "engines": {
     "node": "16.x || 17.x || 18.x"
-  },
-  "husky": {
-    "hooks": {
-      "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
-    }
   },
   "dependencies": {
     "tsup": "^8.3.0"

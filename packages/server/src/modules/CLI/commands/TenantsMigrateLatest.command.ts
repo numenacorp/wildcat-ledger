@@ -46,22 +46,36 @@ export class TenantsMigrateLatestCommand extends BaseCommand {
         this.exit(`The given tenant id ${options.tenant_id} does not exist.`);
       }
 
+      // An organization whose database does not exist (it was deleted, or
+      // never finished building) is skipped. Any other failure fails the
+      // command, but only once every other organization has been migrated,
+      // so that none is cut off halfway through a migration.
+      const failures: Array<{ organizationId: string; error: any }> = [];
+
       const migrateTenant = async (organizationId: string) => {
+        const tenantDb = `${this.configService.get('tenantDatabase.dbNamePrefix')}${organizationId}`;
+        const tenantKnex = this.initTenantKnex(organizationId);
         try {
-          const tenantKnex = this.initTenantKnex(organizationId);
           const [batchNo, _log] = await tenantKnex.migrate.latest();
-          const tenantDb = `${this.configService.get('tenantDatabase.dbNamePrefix')}${organizationId}`;
 
           if (_log.length === 0) {
             this.log('Already up to date');
           }
-
           this.log(
             `Tenant ${tenantDb} > Batch ${batchNo} run: ${_log.length} migrations`,
           );
           this.log('-------------------');
         } catch (error) {
-          this.exit(error);
+          if (error?.code === 'ER_BAD_DB_ERROR') {
+            this.log(
+              `Tenant ${tenantDb} > skipped, the database does not exist`,
+            );
+            this.log('-------------------');
+          } else {
+            failures.push({ organizationId, error });
+          }
+        } finally {
+          await tenantKnex.destroy();
         }
       };
 
@@ -71,10 +85,16 @@ export class TenantsMigrateLatestCommand extends BaseCommand {
           .process((tenant: any) => {
             return migrateTenant(tenant.organizationId);
           });
-        this.success('All tenants are migrated.');
       } else {
         await migrateTenant(options.tenant_id);
       }
+      if (failures.length > 0) {
+        failures.forEach(({ organizationId, error }) => {
+          console.error(`Tenant ${organizationId} > migration failed:`, error);
+        });
+        this.exit(`${failures.length} tenant(s) failed to migrate.`);
+      }
+      this.success('All tenants are migrated.');
     } catch (error) {
       this.exit(error);
     }

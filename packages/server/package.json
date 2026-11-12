@@ -38,7 +38,6 @@
     "@aws-sdk/s3-request-presigner": "^3.583.0",
     "@bigcapital/email-components": "workspace:*",
     "@bigcapital/pdf-templates": "workspace:*",
-    "@bigcapital/sdk-ts": "workspace:*",
     "@bigcapital/utils": "workspace:*",
     "@bull-board/api": "^5.22.0",
     "@bull-board/express": "^5.22.0",

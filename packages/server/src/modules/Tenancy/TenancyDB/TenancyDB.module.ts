@@ -31,17 +31,20 @@ export const TenancyDatabaseProxyProvider = ClsModule.forFeatureAsync({
         user: configService.get('tenantDatabase.user'),
         password: configService.get('tenantDatabase.password'),
         database,
-        charset: 'utf8',
+        charset: configService.get('tenantDatabase.charset'),
+        ssl: configService.get<any>('tenantDatabase.ssl'),
         ...DATE_ONLY_COLUMNS_OPTIONS,
       },
       migrations: {
         directory: configService.get('tenantDatabase.migrationsDir'),
-        loadExtensions: ['.js'],
+        // Compiled output holds `.js` migrations; under a TypeScript runtime
+        // (the test runner) the sources are loaded directly.
+        loadExtensions: [__filename.endsWith('.ts') ? '.ts' : '.js'],
       },
       seeds: {
         directory: configService.get('tenantDatabase.seedsDir'),
       },
-      pool: { min: 0, max: 7 },
+      pool: { min: 0, max: configService.get('tenantDatabase.poolMax') },
       ...knexSnakeCaseMappers({ upperCase: true }),
     });
     lruCache.set(database, knexInstance);

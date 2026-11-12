@@ -2,6 +2,7 @@ import { Knex } from 'knex';
 import { TenantDBAlreadyExists } from './exceptions/TenantDBAlreadyExists';
 import { sanitizeDatabaseName } from '@/utils/sanitize-database-name';
 import { ConfigService } from '@nestjs/config';
+import { collationOf, DatabaseCharset } from '@/common/config/database-charset';
 import { SystemKnexConnection } from '../System/SystemDB/SystemDB.constants';
 import { Inject, Injectable } from '@nestjs/common';
 import { TenantModel } from '../System/models/TenantModel';
@@ -60,8 +61,11 @@ export class TenantDBManager {
 
     await this.throwErrorIfTenantDBExists(tenant);
 
+    const charset = this.configService.get<DatabaseCharset>(
+      'tenantDatabase.charset',
+    );
     await this.systemKnex.raw(
-      `CREATE DATABASE ${databaseName} DEFAULT CHARACTER SET utf8 DEFAULT COLLATE utf8_general_ci`,
+      `CREATE DATABASE ${databaseName} DEFAULT CHARACTER SET ${charset} DEFAULT COLLATE ${collationOf(charset)}`,
     );
   }
 

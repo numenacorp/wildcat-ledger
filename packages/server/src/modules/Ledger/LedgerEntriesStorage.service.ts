@@ -42,10 +42,12 @@ export class LedgerEntriesStorageService {
     const saveEntryQueue = async.queue(this.saveEntryTask.bind(this), 10);
     const entries = ledger.filter(filterBlankEntry).getEntries();
 
-    entries.forEach((entry) => {
-      saveEntryQueue.push({ entry, trx });
-    });
-    if (entries.length > 0) await saveEntryQueue.drain();
+    // Each entry is awaited, so that an entry that could not be saved fails
+    // the write. Pushed and merely drained, a failure went unseen and the
+    // document was kept with rows missing from the books.
+    await Promise.all(
+      entries.map((entry) => saveEntryQueue.pushAsync({ entry, trx })),
+    );
   };
 
   /**
@@ -81,16 +83,15 @@ export class LedgerEntriesStorageService {
       .query(trx)
       .insertAndFetch(transaction);
 
-    if (entry.trackingCategories?.length) {
-      await this.accountTransactionTrackingCategoryModel()
-        .query(trx)
-        .insert(
-          entry.trackingCategories.map(({ categoryId, optionId }) => ({
-            accountTransactionId: insertedTransaction.id,
-            categoryId,
-            optionId,
-          })),
-        );
+    // One row at a time: the models refuse to insert several rows in
+    // one statement on MySQL and MariaDB, and the refusal was lost in the
+    // save queue, leaving a row with two categories carrying none.
+    for (const { categoryId, optionId } of entry.trackingCategories ?? []) {
+      await this.accountTransactionTrackingCategoryModel().query(trx).insert({
+        accountTransactionId: insertedTransaction.id,
+        categoryId,
+        optionId,
+      });
     }
   };
 

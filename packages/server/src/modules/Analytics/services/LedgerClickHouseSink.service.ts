@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ClsService } from 'nestjs-cls';
@@ -10,6 +10,7 @@ import {
 import { ILedger } from '../../Ledger/types/Ledger.types';
 import { LedgerAnalyticsDirtySet } from './LedgerAnalyticsDirtySet.service';
 import { AccountingBasis } from '@/common/types/AccountingBasis';
+import { ClickHouseSchemaService } from './ClickHouseSchema.service';
 
 @Injectable()
 export class LedgerClickHouseSink {
@@ -18,6 +19,8 @@ export class LedgerClickHouseSink {
     private readonly syncQueue: Queue,
     private readonly dirtySet: LedgerAnalyticsDirtySet,
     private readonly cls: ClsService,
+    @Optional()
+    private readonly schemaService?: ClickHouseSchemaService,
   ) {}
 
   /**
@@ -96,6 +99,8 @@ export class LedgerClickHouseSink {
    */
   private enqueue(payload: ILedgerAnalyticsSyncJobPayload): void {
     if (payload.deltas.length === 0) return;
+    // Nothing to sync to when the analytics store is switched off.
+    if (this.schemaService && !this.schemaService.isEnabled()) return;
 
     this.syncQueue
       .add('sync-ledger', payload, {

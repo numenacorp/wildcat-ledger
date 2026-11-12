@@ -5,6 +5,7 @@ import * as path from 'path';
 import './utils/moment-mysql';
 import { AppModule } from './modules/App/App.module';
 import { NestExpressApplication } from '@nestjs/platform-express';
+import { applyRequestBodyLimit } from './common/request-body';
 
 global.__public_dirname = path.join(__dirname, '..', 'public');
 global.__static_dirname = path.join(__dirname, '../static');
@@ -16,6 +17,7 @@ async function bootstrap() {
     rawBody: true,
   });
   app.set('query parser', 'extended');
+  applyRequestBodyLimit(app, '/api/ledger');
   app.setGlobalPrefix('/api');
 
   // create and mount the middleware manually here

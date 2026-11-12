@@ -102,10 +102,12 @@ export class EditManualJournal {
    * Edits jouranl entries.
    * @param {number} manualJournalId - Manual journal id.
    * @param {IMakeJournalDTO} manualJournalDTO - Manual journal DTO.
+   * @param {Knex.Transaction} trx - Joins this transaction when given.
    */
   public async editJournalEntries(
     manualJournalId: number,
     manualJournalDTO: EditManualJournalDto,
+    trx?: Knex.Transaction,
   ): Promise<{
     manualJournal: ManualJournal;
     oldManualJournal: ManualJournal;
@@ -173,6 +175,6 @@ export class EditManualJournal {
       } as IManualJournalEventEditedPayload);
 
       return { manualJournal, oldManualJournal };
-    });
+    }, trx);
   }
 }

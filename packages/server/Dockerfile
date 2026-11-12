@@ -49,15 +49,8 @@ COPY --chown=nodejs:nodejs package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=nodejs:nodejs packages/server/package.json ./packages/server/
 COPY --chown=nodejs:nodejs shared ./shared
 
-# Copy .husky directory (needed for husky install command)
-COPY --chown=nodejs:nodejs .husky ./.husky
-
-# Install only production dependencies
-# Install husky temporarily so prepare script can run, then remove it
-RUN pnpm add -D -w husky && \
-    pnpm install --prod --frozen-lockfile && \
-    pnpm remove -w husky && \
-    # Remove build dependencies to reduce image size
+# Install only production dependencies, then drop the build tools
+RUN pnpm install --prod --frozen-lockfile && \
     apk del python3 build-base
 
 # Copy built application from builder stage

@@ -1,0 +1,10 @@
+# Local runs only (scripts/local-up.sh), where the server runs on the host and
+# not in the stack. The converter fetches the page to print from the server,
+# and a host firewall can drop traffic from a container to a host port, so
+# here the converter shares the host's network and reaches it on loopback.
+services:
+  gotenberg:
+    network_mode: host
+    ports: !reset []
+    extra_hosts: !reset []
+    command: ['gotenberg', '--api-port=${GOTENBERG_HOST_PORT:-39100}']

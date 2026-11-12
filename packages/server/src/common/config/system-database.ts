@@ -1,4 +1,6 @@
 import { registerAs } from '@nestjs/config';
+import { resolveDatabaseCharset } from './database-charset';
+import { resolveDatabaseSsl } from './database-ssl';
 
 export default registerAs('systemDatabase', () => ({
   client: 'mysql',
@@ -7,6 +9,11 @@ export default registerAs('systemDatabase', () => ({
   user: process.env.SYSTEM_DB_USER || process.env.DB_USER,
   password: process.env.SYSTEM_DB_PASSWORD || process.env.DB_PASSWORD,
   databaseName: process.env.SYSTEM_DB_NAME || process.env.DB_NAME,
+  charset: resolveDatabaseCharset(
+    process.env.SYSTEM_DB_CHARSET,
+    process.env.DB_CHARSET,
+  ),
+  ssl: resolveDatabaseSsl(process.env.SYSTEM_DB_SSL, process.env.DB_SSL),
   migrationDir:
     process.env.SYSTEM_DB_MIGRATION_DIR || './src/database/system/migrations',
   seedsDir: process.env.SYSTEM_DB_SEEDS_DIR || './src/database/system/seeds',

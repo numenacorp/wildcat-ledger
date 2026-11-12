@@ -112,6 +112,7 @@ import { NotificationsModule } from '../Notifications/Notifications.module';
 import { EEModule } from '../EE/EE.module';
 import { AnalyticsModule } from '../Analytics/Analytics.module';
 import { ThrottlerGuard } from '@nestjs/throttler';
+import { LedgerExtModule } from '../LedgerExt/LedgerExt.module';
 import { AppThrottleModule } from './AppThrottle.module';
 
 @Module({
@@ -153,6 +154,7 @@ import { AppThrottleModule } from './AppThrottle.module';
           host: configService.get('queue.host'),
           port: configService.get('queue.port'),
         },
+        prefix: configService.get('queue.prefix'),
       }),
       inject: [ConfigService],
     }),
@@ -274,6 +276,7 @@ import { AppThrottleModule } from './AppThrottle.module';
     AnalyticsModule,
     ExchangeRatesModule,
     WebhooksModule,
+    LedgerExtModule,
   ],
   controllers: [AppController],
   providers: [

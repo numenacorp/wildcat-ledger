@@ -32,7 +32,7 @@ jobs:
 
     services:
       mysql:
-        image: mariadb:10.6
+        image: mariadb:11.8
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: bigcapital_system
@@ -129,7 +129,7 @@ jobs:
 
       - name: Grant tenant database privileges
         run: |
-          CID=$(docker ps -qf "ancestor=mariadb:10.6" | head -1)
+          CID=$(docker ps -qf "ancestor=mariadb:11.8" | head -1)
           docker exec "$CID" mysql -uroot -proot -e \
             "GRANT ALL PRIVILEGES ON *.* TO 'bigcapital'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
 

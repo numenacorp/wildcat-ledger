@@ -86,12 +86,18 @@ export class LedegrAccountsStorage {
       effectedAccountsIds,
       trx,
     );
-    dependAccountsIds.forEach((accountId: number) => {
-      saveAccountsBalanceQueue.push({ ledger: balanceLedger, accountId, trx });
-    });
-    if (dependAccountsIds.length > 0) {
-      await saveAccountsBalanceQueue.drain();
-    }
+    // Each task is awaited, so that one that fails, a deadlock among them,
+    // fails the write. Pushed and merely drained, the failure went unseen
+    // and the write carried on in a transaction already rolled back.
+    await Promise.all(
+      dependAccountsIds.map((accountId: number) =>
+        saveAccountsBalanceQueue.pushAsync({
+          ledger: balanceLedger,
+          accountId,
+          trx,
+        }),
+      ),
+    );
   };
 
   /**

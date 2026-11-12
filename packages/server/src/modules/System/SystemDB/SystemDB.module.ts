@@ -21,7 +21,8 @@ const providers = [
         user: configService.get('systemDatabase.user'),
         password: configService.get('systemDatabase.password'),
         database: configService.get('systemDatabase.databaseName'),
-        charset: 'utf8',
+        charset: configService.get('systemDatabase.charset'),
+        ssl: configService.get<any>('systemDatabase.ssl'),
         ...DATE_ONLY_COLUMNS_OPTIONS,
       },
       migrations: {

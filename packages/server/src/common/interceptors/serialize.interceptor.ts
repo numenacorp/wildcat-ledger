@@ -8,6 +8,7 @@ import {
 import { type Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { mapKeysDeep } from '@/utils/deepdash';
+import { getOpaqueKeys, withOpaqueKeys } from '@/common/decorators/OpaqueKeys';
 
 export function camelToSnake<T = any>(value: T): T {
   if (value === null || value === undefined) {
@@ -64,11 +65,20 @@ export class SerializeInterceptor implements NestInterceptor<any, any> {
   ): Observable<any> {
     const request = context.switchToHttp().getRequest();
 
+    // Properties the controller keeps out of the key rewriting.
+    const opaqueKeys = getOpaqueKeys(context.getClass());
+
     // Transform both body and query parameters
-    request.body = this.strategy.in(request.body);
+    request.body = withOpaqueKeys(request.body, opaqueKeys, this.strategy.in);
     request.query = this.strategy.in(request.query);
 
     // handle returns stream..
-    return next.handle().pipe(map(this.strategy.out));
+    return next
+      .handle()
+      .pipe(
+        map((response) =>
+          withOpaqueKeys(response, opaqueKeys, this.strategy.out),
+        ),
+      );
   }
 }
