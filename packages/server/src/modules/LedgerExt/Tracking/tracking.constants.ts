@@ -1,9 +1,21 @@
 import { ExtRecordKind } from '../LedgerExt.constants';
-import { BILLS, INVOICES, TradeConfig } from '../Trade/trade.config';
+import {
+  BILLS,
+  CREDIT_NOTES,
+  INVOICES,
+  TradeConfig,
+  VENDOR_CREDITS,
+} from '../Trade/trade.config';
 
 export const TRACKING_ERRORS = {
   CATEGORY_NOT_FOUND: 'tracking_category_not_found',
   OPTION_NOT_FOUND: 'tracking_option_not_found',
+  /** A write names a category that has not been made. */
+  UNKNOWN_CATEGORY: 'TRACKING_CATEGORY_NOT_FOUND',
+  /** A write names an option its category does not have. */
+  UNKNOWN_OPTION: 'TRACKING_OPTION_NOT_FOUND',
+  /** A write names an option that has been archived. */
+  OPTION_ARCHIVED: 'TRACKING_OPTION_ARCHIVED',
   LINE_NOT_FOUND: 'line_not_found',
   LINK_NOT_FOUND: 'tracking_link_not_found',
 };
@@ -28,4 +40,12 @@ export const LINE_TYPES: Record<
   journal_line: { kind: ExtRecordKind.ManualJournalEntry, config: null },
   bill_line: { kind: ExtRecordKind.BillEntry, config: BILLS },
   invoice_line: { kind: ExtRecordKind.SaleInvoiceEntry, config: INVOICES },
+  vendor_credit_line: {
+    kind: ExtRecordKind.VendorCreditEntry,
+    config: VENDOR_CREDITS,
+  },
+  credit_note_line: {
+    kind: ExtRecordKind.CreditNoteEntry,
+    config: CREDIT_NOTES,
+  },
 };

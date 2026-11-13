@@ -111,7 +111,9 @@ describe('Ledger extension: shared services', () => {
       );
 
       expect(first.created).toBe(true);
+      expect(first.replayed).toBe(false);
       expect(second.created).toBe(false);
+      expect(second.replayed).toBe(true);
       expect(second.recordId).toBe(first.recordId);
       expect(create).toHaveBeenCalledTimes(1);
       expect(await journalsWithReference(externalId)).toHaveLength(1);
@@ -140,6 +142,7 @@ describe('Ledger extension: shared services', () => {
       );
 
       expect(results.filter((r) => r.created)).toHaveLength(1);
+      expect(results.filter((r) => r.replayed)).toHaveLength(11);
       expect(new Set(results.map((r) => r.recordId)).size).toBe(1);
       expect(await journalsWithReference(externalId)).toHaveLength(1);
       // 12 requests, one journal of two lines: two ledger rows, not twenty-four.
@@ -207,41 +210,141 @@ describe('Ledger extension: shared services', () => {
       expect(await journalsWithReference(externalId)).toHaveLength(1);
     });
 
-    it('a released id can be reused, and no longer finds the old record', async () => {
-      const externalId = `reuse:${randomUUID()}`;
+    it('answers a repeat with the same body as a replay, and another body as a conflict', async () => {
+      const externalId = `body:${randomUUID()}`;
       const read = async (id: number) => ({ id });
-      const create = (trx: Knex.Transaction) => createJournal(externalId, trx);
+      const create = jest.fn((trx: Knex.Transaction) =>
+        createJournal(externalId, trx),
+      );
+      const body = { amount: '10.00', lines: [{ a: 1, b: 2 }] };
+
+      const first = await org.inTenant(() =>
+        externalIds.createOnce({ kind, externalId, body, create, read }),
+      );
+      expect(first.created).toBe(true);
+      expect(first.replayed).toBe(false);
+
+      // The same values with the keys written in another order are the same body.
+      const again = await org.inTenant(() =>
+        externalIds.createOnce({
+          kind,
+          externalId,
+          body: { lines: [{ b: 2, a: 1 }], amount: '10.00' },
+          create,
+          read,
+        }),
+      );
+      expect(again.created).toBe(false);
+      expect(again.replayed).toBe(true);
+      expect(again.recordId).toBe(first.recordId);
+
+      // One changed value is another body. The record is described for the answer.
+      await expect(
+        org.inTenant(() =>
+          externalIds.createOnce({
+            kind,
+            externalId,
+            body: { ...body, amount: '10.01' },
+            describe: async () => ({ version: 4 }),
+            create,
+            read,
+          }),
+        ),
+      ).rejects.toMatchObject({
+        errorType: 'EXTERNAL_ID_IN_USE',
+        payload: {
+          kind,
+          externalId,
+          recordId: first.recordId,
+          state: 'live',
+          version: 4,
+        },
+      });
+
+      // A record its describer calls voided is refused whatever the body.
+      await expect(
+        org.inTenant(() =>
+          externalIds.createOnce({
+            kind,
+            externalId,
+            body,
+            describe: async () => ({ state: 'voided', version: 5 }),
+            create,
+            read,
+          }),
+        ),
+      ).rejects.toMatchObject({
+        errorType: 'EXTERNAL_ID_IN_USE',
+        payload: { recordId: first.recordId, state: 'voided', version: 5 },
+      });
+
+      // A record made on first sight from its id alone answers any body.
+      const any = await org.inTenant(() =>
+        externalIds.createOnce({
+          kind,
+          externalId,
+          anyBody: true,
+          create,
+          read,
+        }),
+      );
+      expect(any.replayed).toBe(true);
+      expect(any.recordId).toBe(first.recordId);
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(await journalsWithReference(externalId)).toHaveLength(1);
+    });
+
+    it('the id of a deleted record stays held: it finds no record and is never used again', async () => {
+      const externalId = `spent:${randomUUID()}`;
+      const read = async (id: number) => ({ id });
+      const create = jest.fn((trx: Knex.Transaction) =>
+        createJournal(externalId, trx),
+      );
 
       const first = await org.inTenant(() =>
         externalIds.createOnce({ kind, externalId, create, read }),
       );
       await org.inTenant(() =>
         uow.withTransaction((trx) =>
-          externalIds.release(kind, first.recordId, trx),
+          externalIds.markDeleted(kind, first.recordId, trx),
         ),
       );
       expect(
         await org.inTenant(() => externalIds.findRecordId(kind, externalId)),
       ).toBeNull();
-
-      const second = await org.inTenant(() =>
-        externalIds.createOnce({ kind, externalId, create, read }),
-      );
-      expect(second.created).toBe(true);
-      expect(second.recordId).not.toBe(first.recordId);
       expect(
-        await org.inTenant(() => externalIds.findRecordId(kind, externalId)),
-      ).toBe(second.recordId);
-
-      // Releasing twice keeps both released rows.
-      await org.inTenant(() =>
-        uow.withTransaction((trx) =>
-          externalIds.release(kind, second.recordId, trx),
+        await org.inTenant(() =>
+          externalIds.findExternalId(kind, first.recordId),
         ),
-      );
+      ).toBeNull();
+      // A deleted record is still shown with the id it carried.
+      expect(
+        await org.inTenant(() =>
+          externalIds.findLastExternalId(kind, first.recordId),
+        ),
+      ).toBe(externalId);
+
+      // The same body as the first create: still refused, and nothing is made.
+      await expect(
+        org.inTenant(() =>
+          externalIds.createOnce({ kind, externalId, create, read }),
+        ),
+      ).rejects.toMatchObject({
+        errorType: 'EXTERNAL_ID_IN_USE',
+        payload: {
+          kind,
+          externalId,
+          recordId: first.recordId,
+          state: 'deleted',
+          version: null,
+        },
+      });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(await journalsWithReference(externalId)).toHaveLength(1);
       expect(
         await tableRows(org, 'ext_external_ids', { externalId }),
-      ).toHaveLength(2);
+      ).toHaveLength(1);
     });
 
     it('the same id may be used by records of different kinds', async () => {
@@ -417,7 +520,7 @@ describe('Ledger extension: shared services', () => {
             kind,
             21,
             {
-              transactedAt: '2031-07-01T04:30:00.000Z',
+              transactedOn: '2031-06-30',
               paymentMethod: 'check',
               reference: 'REF-1',
               memo: 'first',
@@ -434,11 +537,14 @@ describe('Ledger extension: shared services', () => {
       expect(await org.inTenant(() => documents.get(kind, 21))).toEqual({
         kind,
         recordId: 21,
-        transactedAt: '2031-07-01T04:30:00.000Z',
+        transactedOn: '2031-06-30',
         paymentMethod: 'check',
         reference: 'REF-1',
         memo: 'second',
         createdBy: null,
+        // The row's version starts at 1. Writing its fields does not raise it:
+        // the change that names a version does.
+        version: 1,
         voidedAt: null,
         voidSnapshot: null,
       });
@@ -455,26 +561,15 @@ describe('Ledger extension: shared services', () => {
       };
       await org.inTenant(() =>
         uow.withTransaction(async (trx) => {
-          await documents.upsert(
-            kind,
-            22,
-            { transactedAt: '2031-08-01T17:00:00.000Z' },
-            trx,
-          );
-          await documents.markVoided(
-            kind,
-            22,
-            '2031-08-02T17:00:00.000Z',
-            snapshot,
-            trx,
-          );
+          await documents.upsert(kind, 22, { transactedOn: '2031-08-01' }, trx);
+          await documents.markVoided(kind, 22, '2031-08-02', snapshot, trx);
         }),
       );
       const voided = await org.inTenant(() => documents.listVoided(kind));
       expect(voided.map((d) => d.recordId)).toEqual([22]);
       expect(voided[0].voidSnapshot).toEqual(snapshot);
-      expect(voided[0].voidedAt).toBe('2031-08-02T17:00:00.000Z');
-      expect(voided[0].transactedAt).toBe('2031-08-01T17:00:00.000Z');
+      expect(voided[0].voidedAt).toBe('2031-08-02');
+      expect(voided[0].transactedOn).toBe('2031-08-01');
     });
   });
 
@@ -538,7 +633,7 @@ describe('Ledger extension: shared services', () => {
         );
 
       await set('reporting_basis', 'cash');
-      await set('lock', { at: '2031-06-30T05:00:00.000Z' });
+      await set('lock', { at: '2031-06-30' });
       expect(await org.inTenant(() => settings.get('reporting_basis'))).toBe(
         'cash',
       );
@@ -546,7 +641,7 @@ describe('Ledger extension: shared services', () => {
       await set('reporting_basis', 'accrual');
       expect(await org.inTenant(() => settings.all())).toEqual({
         reporting_basis: 'accrual',
-        lock: { at: '2031-06-30T05:00:00.000Z' },
+        lock: { at: '2031-06-30' },
       });
 
       await set('lock', null);

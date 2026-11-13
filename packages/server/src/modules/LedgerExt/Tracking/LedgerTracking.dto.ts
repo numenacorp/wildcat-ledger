@@ -5,6 +5,7 @@ import {
   IsIn,
   IsInt,
   IsNotEmpty,
+  IsBoolean,
   IsOptional,
   IsString,
   MaxLength,
@@ -65,11 +66,24 @@ export class CreateLedgerTrackingCategoryDto {
 
 @StrictDto()
 export class RenameLedgerTrackingOptionDto {
-  @ApiProperty({ description: 'The name the option is shown under' })
+  @ApiProperty({
+    description: 'The name the option is shown under',
+    required: false,
+  })
+  @IsOptional()
   @IsString()
   @IsNotEmpty()
   @MaxLength(255)
-  displayName: string;
+  displayName?: string;
+
+  @ApiProperty({
+    description:
+      'False archives the option: it stays on the lines that carry it and takes no new one. True restores it',
+    required: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  active?: boolean;
 }
 
 @StrictDto()

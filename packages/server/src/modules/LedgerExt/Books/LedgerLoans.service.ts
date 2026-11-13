@@ -5,7 +5,6 @@ import { TENANCY_DB_CONNECTION } from '@/modules/Tenancy/TenancyDB/TenancyDB.con
 import { ExternalIdsService } from '../common/ExternalIds.service';
 import { ExtMetadataService } from '../common/ExtMetadata.service';
 import { fromCents, toCents } from '../common/money';
-import { toInstant } from '../common/timestamps';
 import { ExtRecordKind } from '../LedgerExt.constants';
 import {
   LedgerAccountBrief,
@@ -14,7 +13,7 @@ import {
 import { ExtLockService } from '../Lock/ExtLock.service';
 import { toIso } from '../Trade/TradePaymentViews.service';
 import { BOOKS_ERRORS, paging } from './books.constants';
-import { OpeningEntriesService } from './OpeningEntries.service';
+import { FundingView, OpeningEntriesService } from './OpeningEntries.service';
 import { CreateLedgerLoanDto } from './LedgerBooks.dto';
 
 const TABLE = 'ext_loans';
@@ -33,7 +32,8 @@ export interface LoanView {
   account: LedgerAccountBrief | null;
   /** What the loan's account holds to date: credits less debits. */
   balance: string;
-  opening: { amount: string; postedAt: string } | null;
+  /** The entry the loan was recorded with, and where its other side went. */
+  funding: FundingView | null;
   createdAt: string | null;
 }
 
@@ -43,8 +43,9 @@ const named = (value: unknown): boolean =>
 /**
  * Loans. A loan is made with an account of its own, a long-term liability
  * under the root of the liabilities, and with what is owed on it at a given
- * instant posted as an opening entry: a debit to opening balance equity, a
- * credit to the loan's account.
+ * instant: a credit to the loan's account, and a debit to the account its
+ * proceeds were received into, or to opening balance equity when the loan
+ * was already owed as the books began.
  */
 @Injectable()
 export class LedgerLoansService {
@@ -59,20 +60,24 @@ export class LedgerLoansService {
   ) {}
 
   /**
-   * Creates a loan, its account and, when given, its opening entry, in one
-   * transaction. A create carrying the external id of an existing loan
-   * answers that loan unchanged.
+   * Creates a loan, its account and, when given, the entry of what is owed, in one
+   * transaction. A create carrying the external id of an existing loan is a
+   * retry when its body is the one the loan was made with; otherwise it is
+   * refused.
    */
-  public async create(dto: CreateLedgerLoanDto): Promise<LoanView> {
-    const openingAt = dto.opening ? toInstant(dto.opening.postedAt) : null;
+  public async create(
+    dto: CreateLedgerLoanDto,
+  ): Promise<{ loan: LoanView; replayed: boolean }> {
+    const funding = await this.openings.prepareFunding(dto.funding);
     const money = (value: string | null | undefined) =>
       named(value) ? fromCents(toCents(value)) : null;
 
-    const { recordId } = await this.externalIds.createOnce({
+    const { recordId, replayed } = await this.externalIds.createOnce({
       kind: ExtRecordKind.Loan,
       externalId: dto.externalId ?? undefined,
+      body: dto,
       create: async (trx) => {
-        if (openingAt) await this.lock.assertOpen([openingAt], trx);
+        if (funding) await this.lock.assertOpen([funding.postedOn], trx);
 
         const accountId = await this.accounts.createWithin(
           {
@@ -99,15 +104,16 @@ export class LedgerLoansService {
           dto.metadata ?? null,
           trx,
         );
-        if (openingAt) {
+        if (funding) {
           await this.openings.post(
             {
               source: 'loan',
               sourceId: id,
               accountId,
               // What is owed is a credit on the loan's account.
-              cents: -toCents(dto.opening.amount),
-              postedAt: openingAt,
+              cents: -funding.cents,
+              postedOn: funding.postedOn,
+              againstAccountId: funding.againstAccountId,
             },
             trx,
           );
@@ -116,7 +122,7 @@ export class LedgerLoansService {
       },
       read: async (id) => id,
     });
-    return this.get(recordId);
+    return { loan: await this.get(recordId), replayed };
   }
 
   public async get(loanId: number): Promise<LoanView> {
@@ -210,12 +216,7 @@ export class LedgerLoansService {
           metadata: (metadata.get(id) as Record<string, unknown>) ?? null,
           account: briefs.get(Number(row.accountId)) ?? null,
           balance: fromCents(balanceOf.get(Number(row.accountId)) ?? 0n),
-          opening: opening
-            ? {
-                amount: fromCents(-toCents(opening.amount)),
-                postedAt: opening.postedAt,
-              }
-            : null,
+          funding: this.openings.fundingView(opening, -1),
           createdAt: toIso(row.createdAt),
         };
       });

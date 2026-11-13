@@ -18,7 +18,8 @@ import {
 } from '@/modules/Organization/Organization.types';
 import { DeleteWorkspaceJobService } from '@/modules/ee/Workspaces/commands/DeleteWorkspaceJob.service';
 import { ExtServiceLocator } from '../common/ExtServiceLocator.service';
-import { toInstant } from '../common/timestamps';
+import { toPlainDate } from '../common/timestamps';
+import { fiscalMonthName, fiscalMonthOf } from './fiscalYear';
 import { isDuplicateKey } from '../common/dbErrors';
 import { validateChart } from '../Accounts/chart';
 import { ProvisionWorkspaceService } from './ProvisionWorkspace.service';
@@ -143,8 +144,8 @@ export class LedgerWorkspacesService {
     const row = await this.getRowOrThrow(userId, workspaceId);
     const changes: Record<string, unknown> = {};
 
-    if (dto.booksStartAt !== undefined) {
-      changes.booksStartAt = toInstant(dto.booksStartAt);
+    if (dto.booksStartOn !== undefined) {
+      changes.booksStartOn = toPlainDate(dto.booksStartOn);
     }
     if (dto.reportingBasis !== undefined) {
       changes.reportingBasis = dto.reportingBasis;
@@ -153,6 +154,12 @@ export class LedgerWorkspacesService {
       await this.systemKnex(TABLE)
         .where({ id: row.id })
         .update({ ...changes, updatedAt: this.systemKnex.fn.now() });
+    }
+    // The fiscal year is Bigcapital's own setting, kept where it keeps it.
+    if (dto.fiscalYearStartMonth !== undefined) {
+      await this.systemKnex('tenants_metadata')
+        .where({ tenantId: row.tenantId })
+        .update({ fiscalYear: fiscalMonthName(dto.fiscalYearStartMonth) });
     }
     return this.get(userId, workspaceId);
   }
@@ -259,9 +266,10 @@ export class LedgerWorkspacesService {
   public async findByOrganization(organizationId: string): Promise<{
     id: number;
     reportingBasis: 'accrual' | 'cash';
-    booksStartAt: string | null;
+    booksStartOn: string | null;
     timezone: string;
     baseCurrency: string;
+    fiscalYearStartMonth: number;
   } | null> {
     const row = await this.systemKnex(TABLE)
       .join('tenants', 'tenants.id', `${TABLE}.tenantId`)
@@ -271,12 +279,16 @@ export class LedgerWorkspacesService {
       .select(
         `${TABLE}.id`,
         `${TABLE}.reportingBasis`,
-        `${TABLE}.booksStartAt`,
+        `${TABLE}.booksStartOn`,
         'tenants_metadata.timezone',
         'tenants_metadata.baseCurrency',
+        'tenants_metadata.fiscalYear',
       )
       .first();
-    return row ?? null;
+    if (!row) return null;
+
+    const { fiscalYear, ...workspace } = row;
+    return { ...workspace, fiscalYearStartMonth: fiscalMonthOf(fiscalYear) };
   }
 
   /** Changes the reporting basis of an organization's workspace. */
@@ -326,7 +338,7 @@ export class LedgerWorkspacesService {
         live: 1,
         status: WorkspaceStatus.Building,
         reportingBasis: dto.reportingBasis ?? ReportingBasis.Accrual,
-        booksStartAt: dto.booksStartAt ? toInstant(dto.booksStartAt) : null,
+        booksStartOn: dto.booksStartOn ? toPlainDate(dto.booksStartOn) : null,
         pendingAccounts: dto.accounts ? JSON.stringify(dto.accounts) : null,
         createdAt: trx.fn.now(),
         updatedAt: trx.fn.now(),
@@ -517,7 +529,7 @@ export class LedgerWorkspacesService {
       location: dto.country,
       baseCurrency: dto.baseCurrency,
       timezone: dto.timezone,
-      fiscalYear: 'january',
+      fiscalYear: fiscalMonthName(dto.fiscalYearStartMonth ?? 1),
       language: 'en',
     } as any);
   }
@@ -564,7 +576,8 @@ export class LedgerWorkspacesService {
       baseCurrency: metadata?.baseCurrency ?? null,
       timezone: metadata?.timezone ?? null,
       reportingBasis: row.reportingBasis,
-      booksStartAt: row.booksStartAt ?? null,
+      booksStartOn: row.booksStartOn ?? null,
+      fiscalYearStartMonth: fiscalMonthOf(metadata?.fiscalYear),
       inactiveAt: row.inactiveAt ?? null,
       status: row.status,
     };

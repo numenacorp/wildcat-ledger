@@ -72,30 +72,38 @@ export function lineCents(rate: string, quantity: string): bigint {
 }
 
 /**
- * Shares an amount out over lines in proportion to them, in whole cents that
- * add up to the amount.
+ * Shares an amount out over weights in proportion to them, in whole cents
+ * that add up to the amount.
  *
- * Each line's share is rounded to the nearest cent, a half going away from
- * zero. The cents the rounding leaves over or short are then taken one at a
- * time from the lines in order of size, largest first, the later line first
- * on a tie. Lines that total zero get nothing.
+ * Largest remainder: each share is rounded down, and the cents that leaves
+ * over go one each to the shares that lost the largest fraction, the earlier
+ * one first on a tie. A negative weight takes part like any other; its share
+ * rounds down too, away from zero. Weights that total zero get nothing.
+ *
+ * With weights that are what is still unpaid on each line, and an amount no
+ * larger than their total, no share goes past its weight, and the amount
+ * that pays the whole of them gives each exactly its weight.
  */
-export function prorate(cents: bigint, lines: bigint[]): bigint[] {
-  const whole = lines.reduce((total, line) => total + line, 0n);
-  if (whole === 0n || lines.length === 0) return lines.map(() => 0n);
+export function shareOut(cents: bigint, weights: bigint[]): bigint[] {
+  const whole = weights.reduce((total, weight) => total + weight, 0n);
+  if (whole === 0n || weights.length === 0) return weights.map(() => 0n);
 
-  const shares = lines.map((line) => divideRounded(cents * line, whole));
-  const bySize = lines
-    .map((line, index) => ({ index, line }))
-    .sort((a, b) =>
-      a.line === b.line ? b.index - a.index : a.line < b.line ? 1 : -1,
-    );
-  let left = cents - shares.reduce((total, share) => total + share, 0n);
+  const parts = weights.map((weight, index) => {
+    const numerator = cents * weight;
+    let share = numerator / whole;
+    // BigInt division drops the fraction towards zero; a share rounds down.
+    if (numerator % whole !== 0n && numerator < 0n !== whole < 0n) share -= 1n;
+    return { index, share, lost: abs(numerator - share * whole) };
+  });
+  let left = cents - parts.reduce((total, part) => total + part.share, 0n);
+  const shares = parts.map((part) => part.share);
 
-  for (let n = 0; left !== 0n; n += 1) {
-    const step = sign(left);
-    shares[bySize[n % bySize.length].index] += step;
-    left -= step;
+  for (const part of [...parts].sort((a, b) =>
+    a.lost === b.lost ? a.index - b.index : a.lost < b.lost ? 1 : -1,
+  )) {
+    if (left === 0n) break;
+    shares[part.index] += 1n;
+    left -= 1n;
   }
   return shares;
 }

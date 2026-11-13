@@ -193,6 +193,28 @@ export async function createTestWorkspace(
   };
 }
 
+/**
+ * Makes a tracking category with the options named, or adds the options it
+ * lacks. A write takes only tags that exist, so a spec makes its tags before
+ * it uses them.
+ */
+export async function createTestTags(
+  app: INestApplication,
+  headers: Record<string, string>,
+  category: string,
+  options: string[],
+): Promise<any> {
+  const res = await request(app.getHttpServer())
+    .post('/ledger/tracking-categories')
+    .set(headers)
+    .send({ name: category, options: options.map((name) => ({ name })) });
+
+  if (res.status !== 201 && res.status !== 200) {
+    throw new Error(`The category ${category} was not made: ${res.status}.`);
+  }
+  return res.body.data;
+}
+
 export async function createTestOrganization(
   app: INestApplication,
 ): Promise<TestOrganization> {
@@ -327,3 +349,78 @@ export const ledgerRows = (
   org: TestOrganization,
   where: Record<string, unknown> = {},
 ): Promise<any[]> => tableRows(org, 'accounts_transactions', where);
+
+/** The routes that change a record and so name the version it was read at. */
+const VERSIONED_ROUTE =
+  /^(\/ledger\/(?:bills|invoices|bill-payments|invoice-payments|vendor-credits|credit-notes|credit-applications|manual-journals|accounts|fixed-assets|vendors|customers)\/\d+)(\/(?:void|archive|restore|applications))?$/;
+
+/**
+ * Sends a write as a spec's `post`, `put` and `del` do.
+ *
+ * A change to a record names the version it was made from. A spec that is
+ * not about versions makes its change from the record as it is now: the
+ * record is read first and its version sent. A call that names a version
+ * itself, in its body or its query, is sent as it is, and so is every call
+ * that changes no record. A record that cannot be read is sent no version,
+ * so the route answers for itself.
+ *
+ * What is returned can be awaited and takes `.expect(status)`, as a
+ * supertest call does.
+ */
+export function change(
+  app: INestApplication,
+  method: 'post' | 'put' | 'delete',
+  path: string,
+  headers: Record<string, string>,
+  body?: unknown,
+): any {
+  const http = () => request(app.getHttpServer());
+  const send = (version?: number) => {
+    if (method === 'delete') {
+      const call = http().delete(path).set(headers);
+      return version === undefined ? call : call.query({ version });
+    }
+    const sent =
+      version === undefined
+        ? body
+        : { ...((body as Record<string, unknown>) ?? {}), version };
+    return http()
+      [method](path)
+      .set(headers)
+      .send(sent as any);
+  };
+  const [bare] = path.split('?');
+  const match = VERSIONED_ROUTE.exec(bare);
+  const named =
+    path.includes('version=') ||
+    (body !== null &&
+      typeof body === 'object' &&
+      'version' in (body as Record<string, unknown>));
+  const changesRecord =
+    match !== null &&
+    (method === 'post' ? match[2] !== undefined : match[2] === undefined);
+
+  if (!changesRecord || named) return send();
+
+  let expected: number | undefined;
+  const call = {
+    expect(status: number) {
+      expected = status;
+      return call;
+    },
+    then(
+      resolve: (value: unknown) => unknown,
+      reject?: (e: unknown) => unknown,
+    ) {
+      return http()
+        .get(match[1])
+        .set(headers)
+        .then((read) => {
+          const sent = send(read.body?.data?.version);
+          return expected === undefined ? sent : sent.expect(expected);
+        })
+        .then(resolve, reject);
+    },
+  };
+  return call;
+}

@@ -14,6 +14,13 @@ export interface ExtAccountNode {
   name: string;
   /** The account number. Unique when present. */
   code: string | null;
+  /**
+   * The heading of one of the five root types (assets, liabilities, equity,
+   * income, expenses): it groups accounts and takes no postings of its own.
+   */
+  isTypeRoot?: boolean;
+  /** Raised by every change to the account. Read only: a write does not set it. */
+  version?: number;
 }
 
 /**
@@ -53,6 +60,7 @@ export class ExtAccountTreeService {
       parentAccountId: node.parentAccountId,
       name: node.name,
       code: node.code,
+      isTypeRoot: Boolean(node.isTypeRoot),
       createdAt: trx.fn.now(),
       updatedAt: trx.fn.now(),
     });
@@ -109,6 +117,8 @@ export class ExtAccountTreeService {
         row.parentAccountId === null ? null : Number(row.parentAccountId),
       name: row.name,
       code: row.code ?? null,
+      isTypeRoot: Boolean(row.isTypeRoot),
+      version: Number(row.version ?? 1),
     };
   }
 }

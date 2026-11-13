@@ -41,11 +41,20 @@ import { LedgerManualJournalsService } from './ManualJournals/LedgerManualJourna
 import { LedgerManualJournalsController } from './ManualJournals/LedgerManualJournals.controller';
 import { LedgerEntriesService } from './Entries/LedgerEntries.service';
 import { LedgerEntriesController } from './Entries/LedgerEntries.controller';
-import { LedgerSettingsController } from './Settings/LedgerSettings.controller';
+import {
+  LedgerLockExceptionsController,
+  LedgerSettingsController,
+} from './Settings/LedgerSettings.controller';
 import { LedgerPostingsService } from './common/LedgerPostings.service';
 import { ExtMarkedAccountsService } from './Accounts/ExtMarkedAccounts.service';
 import { ExtPartiesService } from './Trade/ExtParties.service';
 import { TradeLedgerService } from './Trade/TradeLedger.service';
+import { CreditApplicationsService } from './Trade/CreditApplications.service';
+import {
+  LedgerCreditApplicationsController,
+  LedgerCreditNotesController,
+  LedgerVendorCreditsController,
+} from './Trade/LedgerCredits.controller';
 import { TradePaymentViewsService } from './Trade/TradePaymentViews.service';
 import { TradeDocumentsService } from './Trade/TradeDocuments.service';
 import { TradePaymentsService } from './Trade/TradePayments.service';
@@ -61,7 +70,11 @@ import {
   LedgerInvoicesController,
 } from './Trade/LedgerBills.controller';
 
+import { ExtAuditService } from './common/ExtAudit.service';
+import { LedgerAuditController } from './Audit/LedgerAudit.controller';
+
 const shared = [
+  ExtAuditService,
   ExtUnitOfWork,
   ExternalIdsService,
   ExtMetadataService,
@@ -90,16 +103,21 @@ const shared = [
     BullModule.registerQueue({ name: OrganizationBuildQueue }),
   ],
   controllers: [
+    LedgerAuditController,
     LedgerWorkspacesController,
     // Before the accounts controller: `accounts/:id/lines` is declared here.
     LedgerEntriesController,
     LedgerAccountsController,
     LedgerManualJournalsController,
     LedgerSettingsController,
+    LedgerLockExceptionsController,
     LedgerVendorsController,
     LedgerCustomersController,
     LedgerBillPaymentsController,
     LedgerBillsController,
+    LedgerVendorCreditsController,
+    LedgerCreditNotesController,
+    LedgerCreditApplicationsController,
     LedgerInvoicePaymentsController,
     LedgerInvoicesController,
     LedgerTrackingCategoriesController,
@@ -121,6 +139,7 @@ const shared = [
     LedgerEntriesService,
     ExtPartiesService,
     TradeLedgerService,
+    CreditApplicationsService,
     TradePaymentViewsService,
     TradeDocumentsService,
     TradePaymentsService,

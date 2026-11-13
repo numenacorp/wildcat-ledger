@@ -17,6 +17,7 @@ import { ApiCommonHeaders } from '@/common/decorators/ApiCommonHeaders';
 import { OpaqueKeys } from '@/common/decorators/OpaqueKeys';
 import { LedgerWorkspaceGuard } from '../Workspaces/LedgerWorkspace.guard';
 import { LedgerAccountsService } from './LedgerAccounts.service';
+import { created as answer, VersionDto } from '../common/Version.dto';
 import {
   CreateLedgerAccountDto,
   CreateLedgerChildAccountDto,
@@ -55,10 +56,10 @@ export class LedgerAccountsController {
     @Body() dto: CreateLedgerAccountDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { account, created } = await this.accounts.create(dto);
+    const { account, created, replayed } = await this.accounts.create(dto);
 
     response.status(created ? 201 : 200);
-    return { data: account };
+    return answer(account, replayed);
   }
 
   @Post(':id/children')
@@ -78,11 +79,32 @@ export class LedgerAccountsController {
     return { data: await this.accounts.edit(Number(id), dto) };
   }
 
+  @Post(':id/archive')
+  @HttpCode(200)
+  @ApiOperation({
+    summary:
+      'Archive an account and those beneath it: no new lines, still on every report',
+  })
+  async archive(@Param('id') id: string, @Body() dto: VersionDto) {
+    return {
+      data: await this.accounts.setArchived(Number(id), true, dto?.version),
+    };
+  }
+
+  @Post(':id/restore')
+  @HttpCode(200)
+  @ApiOperation({ summary: 'Restore an archived account and those beneath it' })
+  async restore(@Param('id') id: string, @Body() dto: VersionDto) {
+    return {
+      data: await this.accounts.setArchived(Number(id), false, dto?.version),
+    };
+  }
+
   @Delete(':id')
   @HttpCode(200)
   @ApiOperation({ summary: 'Delete an account' })
-  async delete(@Param('id') id: string) {
-    await this.accounts.delete(Number(id));
+  async delete(@Param('id') id: string, @Query('version') version?: string) {
+    await this.accounts.delete(Number(id), version);
     return { data: { id: Number(id), deleted: true } };
   }
 }

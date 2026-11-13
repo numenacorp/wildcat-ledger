@@ -8,8 +8,11 @@ import {
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import { Response } from 'express';
+import { created as answer } from '../common/Version.dto';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ApiCommonHeaders } from '@/common/decorators/ApiCommonHeaders';
 import { OpaqueKeys } from '@/common/decorators/OpaqueKeys';
@@ -36,10 +39,16 @@ export class LedgerFixedAssetsController {
   @Post('value-updates')
   @ApiOperation({
     summary:
-      'Record a fall in the value of a fixed asset, or return the update carrying the external id',
+      'Record a fall in the value of a fixed asset. A repeat of an external id with the same body answers the update; with another body it is refused',
   })
-  async createValueUpdate(@Body() dto: CreateLedgerValueUpdateDto) {
-    return { data: await this.assets.createValueUpdate(dto) };
+  async createValueUpdate(
+    @Body() dto: CreateLedgerValueUpdateDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { update, replayed } = await this.assets.createValueUpdate(dto);
+    // A retry made nothing: it is answered 200, as every other create's is.
+    response.status(replayed ? 200 : 201);
+    return answer(update, replayed);
   }
 
   @Get('value-updates')
@@ -55,10 +64,15 @@ export class LedgerFixedAssetsController {
   @Post()
   @ApiOperation({
     summary:
-      'Create a fixed asset with its own account, or return the one carrying the external id',
+      'Create a fixed asset with its own account. A repeat of an external id with the same body answers the asset; with another body it is refused',
   })
-  async create(@Body() dto: CreateLedgerFixedAssetDto) {
-    return { data: await this.assets.create(dto) };
+  async create(
+    @Body() dto: CreateLedgerFixedAssetDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { asset, replayed } = await this.assets.create(dto);
+    response.status(replayed ? 200 : 201);
+    return answer(asset, replayed);
   }
 
   @Get()
@@ -91,10 +105,15 @@ export class LedgerLoansController {
   @Post()
   @ApiOperation({
     summary:
-      'Create a loan with its own account, or return the one carrying the external id',
+      'Create a loan with its own account. A repeat of an external id with the same body answers the loan; with another body it is refused',
   })
-  async create(@Body() dto: CreateLedgerLoanDto) {
-    return { data: await this.loans.create(dto) };
+  async create(
+    @Body() dto: CreateLedgerLoanDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { loan, replayed } = await this.loans.create(dto);
+    response.status(replayed ? 200 : 201);
+    return answer(loan, replayed);
   }
 
   @Get()

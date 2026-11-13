@@ -2,6 +2,7 @@ import request = require('supertest');
 import { randomUUID } from 'crypto';
 import { INestApplication } from '@nestjs/common';
 import {
+  change,
   createTestApp,
   createTestWorkspace,
   dropOrganizations,
@@ -70,24 +71,18 @@ describe('Ledger extension: faults found in review', () => {
   const get = (path: string, query: Record<string, unknown> = {}) =>
     http().get(path).query(query).set(ws.headers());
   const post = (path: string, body: unknown = {}) =>
-    http()
-      .post(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'post', path, ws.headers(), body);
   const put = (path: string, body: unknown) =>
-    http()
-      .put(path)
-      .set(ws.headers())
-      .send(body as any);
-  const del = (path: string) => http().delete(path).set(ws.headers());
+    change(app, 'put', path, ws.headers(), body);
+  const del = (path: string) => change(app, 'delete', path, ws.headers());
   const errorType = (res: request.Response) => res.body?.errors?.[0]?.type;
-  const lockAt = (closingAt: string | null) =>
-    put('/ledger/settings', { closing_at: closingAt }).expect(200);
+  const lockAt = (lockedThrough: string | null) =>
+    put('/ledger/settings', { locked_through: lockedThrough }).expect(200);
 
-  const bill = (postedAt: string, rate: string, extra = {}) => ({
+  const bill = (postedOn: string, rate: string, extra = {}) => ({
     external_id: `b:${randomUUID()}`,
     vendor_external_id: 'v-1',
-    posted_at: postedAt,
+    posted_on: postedOn,
     entries: [{ account_id: id['6000'], rate }],
     ...extra,
   });
@@ -114,9 +109,8 @@ describe('Ledger extension: faults found in review', () => {
     let open: any;
 
     beforeAll(async () => {
-      open = (
-        await post('/ledger/bills', bill('2031-04-20T18:00:00Z', '100.00'))
-      ).body.data;
+      open = (await post('/ledger/bills', bill('2031-04-20', '100.00'))).body
+        .data;
     });
 
     afterAll(async () => {
@@ -124,18 +118,19 @@ describe('Ledger extension: faults found in review', () => {
     });
 
     it('refuses a payment dated in the closed period, with no bill and with an open bill', async () => {
-      await lockAt('2031-04-01T00:00:00-05:00');
+      await lockAt('2031-03-31');
 
       const none = await post('/ledger/bill-payments', {
-        paid_at: '2031-03-15T18:00:00Z',
+        paid_on: '2031-03-15',
         amount: '5.00',
         account_id: id['1010'],
+        vendor_id: open.vendor.id,
       });
       expect(none.status).toBe(400);
       expect(errorType(none)).toBe('TRANSACTIONS_DATE_LOCKED');
 
       const onOpenBill = await post('/ledger/bill-payments', {
-        paid_at: '2031-03-15T18:00:00Z',
+        paid_on: '2031-03-15',
         amount: '10.00',
         account_id: id['1010'],
         allocations: [{ bill_id: open.id, amount: '10.00' }],
@@ -150,7 +145,7 @@ describe('Ledger extension: faults found in review', () => {
     it('refuses deleting a payment whose own day has since been closed', async () => {
       await lockAt(null);
       const paid = await post('/ledger/bill-payments', {
-        paid_at: '2031-04-12T18:00:00Z',
+        paid_on: '2031-04-12',
         amount: '10.00',
         account_id: id['1010'],
         allocations: [{ bill_id: open.id, amount: '10.00' }],
@@ -158,7 +153,7 @@ describe('Ledger extension: faults found in review', () => {
       expect(paid.status).toBe(201);
 
       // Closed through 14 April: the payment's day is closed, its bill's is not.
-      await lockAt('2031-04-15T00:00:00-05:00');
+      await lockAt('2031-04-14');
       const res = await del(`/ledger/bill-payments/${paid.body.data.id}`);
       expect(res.status).toBe(400);
       expect(errorType(res)).toBe('TRANSACTIONS_DATE_LOCKED');
@@ -174,7 +169,7 @@ describe('Ledger extension: faults found in review', () => {
         [1, 2, 3, 4].map(() =>
           post(
             '/ledger/bills',
-            bill('2031-05-05T18:00:00Z', '1.00', {
+            bill('2031-05-05', '1.00', {
               vendor_external_id: 'v-new',
             }),
           ),
@@ -226,48 +221,71 @@ describe('Ledger extension: faults found in review', () => {
         asset_id: asset.id,
         amount: '1.00',
         update_type: 'DEPRECIATION_AMORTIZATION',
-        posted_at: '2031-06-30T18:00:00Z',
+        posted_on: '2031-06-30',
         counter_account_id: id['6000'],
       }).expect(201);
     });
   });
 
-  describe('a paid bill moved to another vendor', () => {
-    it("moves the payment's row on payables to the new vendor", async () => {
+  /**
+   * A payment's row on payables names the vendor of the bill it pays. A paid
+   * bill once moved to another vendor and left the row behind; now a paid
+   * bill keeps its vendor, and moves only once the payment is taken off.
+   */
+  describe('a paid bill sent to another vendor', () => {
+    it("is refused, and the payment's row on payables stays with its vendor", async () => {
       const second = (
         await post('/ledger/vendors', { external_id: 'v-2' }).expect(201)
       ).body.data;
-      const made = (
-        await post('/ledger/bills', bill('2031-07-01T18:00:00Z', '40.00'))
-      ).body.data;
-      const paid = (
-        await post('/ledger/bill-payments', {
-          paid_at: '2031-07-02T18:00:00Z',
-          amount: '40.00',
-          account_id: id['1010'],
-          allocations: [{ bill_id: made.id, amount: '40.00' }],
-        }).expect(201)
-      ).body.data;
-      const payableContacts = async () =>
+      const made = (await post('/ledger/bills', bill('2031-07-01', '40.00')))
+        .body.data;
+      const pay = async () =>
+        (
+          await post('/ledger/bill-payments', {
+            paid_on: '2031-07-02',
+            amount: '40.00',
+            account_id: id['1010'],
+            allocations: [{ bill_id: made.id, amount: '40.00' }],
+          }).expect(201)
+        ).body.data;
+      const paid = await pay();
+      const payableContacts = async (paymentId: number) =>
         (
           await ws.rows('accounts_transactions', {
             referenceType: 'BillPayment',
-            referenceId: paid.id,
+            referenceId: paymentId,
           })
         )
           .filter((row) => row.accountId === id['2010'])
           .map((row) => row.contactId);
-
-      expect(await payableContacts()).toEqual([made.vendor.id]);
-
-      const edited = await put(`/ledger/bills/${made.id}`, {
+      const toSecond = {
         vendor_id: second.id,
-        posted_at: '2031-07-01T18:00:00Z',
+        posted_on: '2031-07-01',
         entries: [{ account_id: id['6000'], rate: '40.00' }],
+      };
+
+      expect(await payableContacts(paid.id)).toEqual([made.vendor.id]);
+      const before = (await get(`/ledger/bills/${made.id}`)).body.data;
+
+      const refused = await put(`/ledger/bills/${made.id}`, toSecond);
+      expect(refused.status).toBe(400);
+      expect(errorType(refused)).toBe('BILL_EDIT_HAS_PAYMENTS');
+      expect(refused.body.errors[0].payload).toEqual({
+        billId: made.id,
+        paid: '40.00',
+        changed: ['vendor'],
       });
-      expect(edited.status).toBe(200);
-      expect(edited.body.data.vendor.id).toBe(second.id);
-      expect(await payableContacts()).toEqual([second.id]);
+      expect((await get(`/ledger/bills/${made.id}`)).body.data).toEqual(before);
+      expect(before.vendor.id).toBe(made.vendor.id);
+      expect(await payableContacts(paid.id)).toEqual([made.vendor.id]);
+
+      // With the payment taken off, the bill moves, and a payment made
+      // then names the new vendor.
+      await del(`/ledger/bill-payments/${paid.id}`).expect(200);
+      const moved = await put(`/ledger/bills/${made.id}`, toSecond);
+      expect(moved.status).toBe(200);
+      expect(moved.body.data.vendor.id).toBe(second.id);
+      expect(await payableContacts((await pay()).id)).toEqual([second.id]);
     });
   });
 
@@ -278,7 +296,7 @@ describe('Ledger extension: faults found in review', () => {
       ).body.data;
       const body = (note: string) => ({
         customer_id: customer.id,
-        posted_at: '2031-08-01T18:00:00Z',
+        posted_on: '2031-08-01',
         note,
         entries: [{ account_id: id['4000'], rate: '100.00' }],
       });
@@ -290,18 +308,42 @@ describe('Ledger extension: faults found in review', () => {
         const paid = (
           await post('/ledger/invoice-payments', {
             customer_id: customer.id,
-            paid_at: '2031-08-02T18:00:00Z',
+            paid_on: '2031-08-02',
             amount: '100.00',
             account_id: id['1010'],
             allocations: [{ invoice_id: invoice.id, amount: '100.00' }],
           }).expect(201)
         ).body.data;
 
+        // Both changes are built on what is there now, then sent together:
+        // the edit from the invoice's version, the delete from the payment's.
+        const { version } = (await get(`/ledger/invoices/${invoice.id}`)).body
+          .data;
         const [edited, deleted] = await Promise.all([
-          put(`/ledger/invoices/${invoice.id}`, body(`round ${round}`)),
-          del(`/ledger/invoice-payments/${paid.id}`),
+          put(`/ledger/invoices/${invoice.id}`, {
+            ...body(`round ${round}`),
+            version,
+          }),
+          del(`/ledger/invoice-payments/${paid.id}?version=${paid.version}`),
         ]);
-        expect([edited.status, deleted.status]).toEqual([200, 200]);
+        // The delete always lands. It moves the invoice on by one version,
+        // so the edit, built on the invoice as it stood before, lands only
+        // when it gets there first; behind the delete it is refused as
+        // stale, and lands once it is built again on the invoice as it is.
+        expect(deleted.status).toBe(200);
+        if (edited.status !== 200) {
+          expect([edited.status, errorType(edited)]).toEqual([
+            409,
+            'STALE_VERSION',
+          ]);
+          await put(
+            `/ledger/invoices/${invoice.id}`,
+            body(`round ${round}`),
+          ).expect(200);
+        }
+        expect(
+          (await get(`/ledger/invoices/${invoice.id}`)).body.data.note,
+        ).toBe(`round ${round}`);
         expect(
           await ws.rows('accounts_transactions', {
             referenceType: 'PaymentReceive',
@@ -319,7 +361,7 @@ describe('Ledger extension: faults found in review', () => {
     it('is refused, as a row and as a running balance', async () => {
       const tooLarge = await post(
         '/ledger/bills',
-        bill('2031-09-01T18:00:00Z', '999999999999', {
+        bill('2031-09-01', '999999999999', {
           entries: [
             { account_id: id['6000'], rate: '999999999999', quantity: '999' },
           ],
@@ -330,7 +372,7 @@ describe('Ledger extension: faults found in review', () => {
 
       const justOver = await post(
         '/ledger/bills',
-        bill('2031-09-01T18:00:00Z', '10000000000.00'),
+        bill('2031-09-01', '10000000000.00'),
       );
       expect(justOver.status).toBe(400);
       expect(errorType(justOver)).toBe('AMOUNT_TOO_LARGE');
@@ -339,7 +381,7 @@ describe('Ledger extension: faults found in review', () => {
       // accounts it touches stay within what they hold.
       const large = await post(
         '/ledger/bills',
-        bill('2031-09-01T18:00:00Z', '9000000000.00'),
+        bill('2031-09-01', '9000000000.00'),
       );
       expect(large.status).toBe(201);
       expect(large.body.data.amount).toBe('9000000000.00');
@@ -347,21 +389,22 @@ describe('Ledger extension: faults found in review', () => {
       // A second one would carry the payable's balance past what it holds.
       const second = await post(
         '/ledger/bills',
-        bill('2031-09-01T18:00:00Z', '9000000000.00'),
+        bill('2031-09-01', '9000000000.00'),
       );
       expect(second.status).toBe(400);
       expect(errorType(second)).toBe('AMOUNT_TOO_LARGE');
 
       await put(`/ledger/bills/${large.body.data.id}`, {
         vendor_external_id: 'v-1',
-        posted_at: '2031-09-01T18:00:00Z',
+        posted_on: '2031-09-01',
         entries: [{ account_id: id['6000'], rate: '1.00' }],
       }).expect(200);
 
       const payment = await post('/ledger/bill-payments', {
-        paid_at: '2031-09-02T18:00:00Z',
+        paid_on: '2031-09-02',
         amount: '10000000000.00',
         account_id: id['1010'],
+        vendor_id: large.body.data.vendor.id,
       });
       expect(payment.status).toBe(400);
       expect(errorType(payment)).toBe('AMOUNT_TOO_LARGE');
@@ -392,7 +435,7 @@ describe('Ledger extension: faults found in review', () => {
       });
       expect(big.status).toBe(201);
       const bigger = await post('/ledger/manual-journals', {
-        posted_at: '2031-10-01T18:00:00Z',
+        posted_on: '2031-10-01',
         description: 'x'.repeat(300 * 1024),
         entries: [
           { account_id: id['6000'], debit: '1.00', credit: '0' },
@@ -403,15 +446,17 @@ describe('Ledger extension: faults found in review', () => {
     });
   });
 
-  describe('the closing instant', () => {
+  describe('the lock', () => {
     it('is read back as none once cleared, and set again', async () => {
-      await lockAt('2031-02-01T00:00:00-06:00');
+      await lockAt('2031-01-31');
       await lockAt(null);
-      expect((await get('/ledger/settings')).body.data.closing_at).toBeNull();
+      expect(
+        (await get('/ledger/settings')).body.data.locked_through,
+      ).toBeNull();
 
-      // With the lock cleared a write dated before the old closing is open.
+      // With the lock cleared a write dated on a day that was locked is open.
       await post('/ledger/manual-journals', {
-        posted_at: '2031-01-10T18:00:00Z',
+        posted_on: '2031-01-10',
         entries: [
           { account_id: id['6000'], debit: '1.00', credit: '0' },
           { account_id: id['1010'], debit: '0', credit: '1.00' },

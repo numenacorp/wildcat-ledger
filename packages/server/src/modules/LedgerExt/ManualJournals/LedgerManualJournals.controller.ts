@@ -23,6 +23,7 @@ import {
   ListLedgerManualJournalsQueryDto,
 } from './LedgerManualJournal.dto';
 
+import { created as answer } from '../common/Version.dto';
 @ApiTags('Ledger: Manual Journals')
 @Controller('ledger/manual-journals')
 @ApiCommonHeaders()
@@ -34,16 +35,16 @@ export class LedgerManualJournalsController {
   @Post()
   @ApiOperation({
     summary:
-      'Create a published manual journal, or return the one carrying the external id',
+      'Create a published manual journal. A repeat of an external id with the same body answers the journal; with another body it is refused',
   })
   async create(
     @Body() dto: LedgerManualJournalDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { journal, created } = await this.journals.create(dto);
+    const { journal, created, replayed } = await this.journals.create(dto);
 
     response.status(created ? 201 : 200);
-    return { data: journal };
+    return answer(journal, replayed);
   }
 
   @Post('bulk')
@@ -75,8 +76,8 @@ export class LedgerManualJournalsController {
   @Delete(':id')
   @HttpCode(200)
   @ApiOperation({ summary: 'Delete a manual journal' })
-  async delete(@Param('id') id: string) {
-    await this.journals.delete(Number(id));
+  async delete(@Param('id') id: string, @Query('version') version?: string) {
+    await this.journals.delete(Number(id), version);
     return { data: { id: Number(id), deleted: true } };
   }
 }

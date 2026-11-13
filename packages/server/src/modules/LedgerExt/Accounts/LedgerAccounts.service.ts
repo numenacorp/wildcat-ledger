@@ -1,4 +1,9 @@
 import { Knex } from 'knex';
+import {
+  raiseVersion,
+  refusingStale,
+  requireVersion,
+} from '../common/versions';
 import { randomBytes } from 'crypto';
 import { HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { ClsService } from 'nestjs-cls';
@@ -6,6 +11,8 @@ import { ServiceError } from '@/modules/Items/ServiceError';
 import { TENANCY_DB_CONNECTION } from '@/modules/Tenancy/TenancyDB/TenancyDB.constants';
 import { CreateAccountService } from '@/modules/Accounts/CreateAccount.service';
 import { DeleteAccount } from '@/modules/Accounts/DeleteAccount.service';
+import { ActivateAccount } from '@/modules/Accounts/ActivateAccount.service';
+import { AuditAction, ExtAuditService } from '../common/ExtAudit.service';
 import { ExtUnitOfWork } from '../common/ExtUnitOfWork.service';
 import { ExternalIdsService } from '../common/ExternalIds.service';
 import { ExtMetadataService } from '../common/ExtMetadata.service';
@@ -13,9 +20,10 @@ import { ExtSettingsService } from '../common/ExtSettings.service';
 import { ExtServiceLocator } from '../common/ExtServiceLocator.service';
 import { LedgerRowsService } from '../common/LedgerRows.service';
 import { fromThousandths, toThousandths } from '../common/decimal';
-import { toInstant } from '../common/timestamps';
+import { previousDay, toPlainDate } from '../common/timestamps';
 import { ExtRecordKind } from '../LedgerExt.constants';
 import { LedgerWorkspacesService } from '../Workspaces/LedgerWorkspaces.service';
+import { fiscalYearStart } from '../Workspaces/fiscalYear';
 import { ExtMarkedAccountsService } from './ExtMarkedAccounts.service';
 import {
   ExtAccountNode,
@@ -46,6 +54,7 @@ interface AccountRow {
   slug: string;
   accountType: string;
   predefined: number | boolean;
+  active: number | boolean;
 }
 
 /**
@@ -56,6 +65,8 @@ interface AccountRow {
  * accounts the workspace was not created with) is listed only once it has
  * been posted to.
  */
+const TREE_TABLE = 'ext_account_tree';
+
 @Injectable()
 export class LedgerAccountsService {
   constructor(
@@ -71,7 +82,28 @@ export class LedgerAccountsService {
     private readonly locator: ExtServiceLocator,
     private readonly workspaces: LedgerWorkspacesService,
     private readonly marked: ExtMarkedAccountsService,
+    private readonly audit: ExtAuditService,
   ) {}
+
+  /** The audit row of a change to an account, inside the change's transaction. */
+  private logAccount(
+    action: AuditAction,
+    accountId: number,
+    before: LedgerAccountResponseDto | null,
+    trx: Knex.Transaction,
+    code?: string | null,
+  ): Promise<number> {
+    return this.audit.record(
+      {
+        action,
+        subject: ExtRecordKind.Account,
+        subjectId: accountId,
+        number: code ?? before?.code ?? null,
+        before,
+      },
+      trx,
+    );
+  }
 
   /**
    * Lists every account of the chart, flat, in code order, with its balance
@@ -82,17 +114,28 @@ export class LedgerAccountsService {
   ): Promise<LedgerAccountResponseDto[]> {
     const defaults = await this.ledgerDefaults();
     const basis = query.basis ?? defaults.basis;
-    const from = query.from ? toInstant(query.from) : null;
+    const from = query.from ? toPlainDate(query.from) : null;
     const notBefore =
-      query.includeBeforeStart === 'true' ? null : defaults.booksStartAt;
+      query.includeBeforeStart === 'true' ? null : defaults.booksStartOn;
     const trackingOptionIds = await this.trackingOptionIds(query);
+    const to = query.to ? toPlainDate(query.to) : null;
+    // What income and expense accounts held before the fiscal year of the
+    // last day asked for: what a balance sheet counts as retained earnings.
+    const priorYears = to
+      ? await this.ledgerRows.balances({
+          to: previousDay(fiscalYearStart(to, defaults.fiscalYearStartMonth)),
+          notBefore,
+          basis,
+          trackingOptionIds,
+        })
+      : null;
     const [accounts, nodes, balances, opening, posted, helperIds] =
       await Promise.all([
         this.accountRows(),
         this.tree.list(),
         this.ledgerRows.balances({
           from,
-          to: query.to ? toInstant(query.to) : null,
+          to,
           notBefore,
           basis,
           trackingOptionIds,
@@ -100,7 +143,7 @@ export class LedgerAccountsService {
         // Everything dated before the range, asked for with a start only.
         from
           ? this.ledgerRows.balances({
-              to: from,
+              to: previousDay(from),
               notBefore,
               basis,
               trackingOptionIds,
@@ -157,6 +200,9 @@ export class LedgerAccountsService {
           name: node?.name ?? account.name,
           accountType: account.accountType,
           parentId: node?.parentAccountId ?? null,
+          isTypeRoot: Boolean(node?.isTypeRoot),
+          version: node?.version ?? 1,
+          active: Boolean(account.active),
           externalId: externalIds.get(account.id) ?? null,
           metadata: metadata.get(account.id) ?? null,
           deletable:
@@ -171,6 +217,14 @@ export class LedgerAccountsService {
                   withDescendants(opening, account.id),
                 ),
                 ownOpeningBalance: fromThousandths(own(opening, account.id)),
+              }
+            : {}),
+          ...(priorYears &&
+          ['income', 'expense'].includes(rootTypeOf(account.accountType))
+            ? {
+                priorYearsBalance: fromThousandths(
+                  withDescendants(priorYears, account.id),
+                ),
               }
             : {}),
         };
@@ -193,9 +247,11 @@ export class LedgerAccountsService {
    * Creates an account. With an external id the create is repeat-safe: a
    * repeat returns the account the first call made.
    */
-  public async create(
-    dto: CreateLedgerAccountDto,
-  ): Promise<{ account: LedgerAccountResponseDto; created: boolean }> {
+  public async create(dto: CreateLedgerAccountDto): Promise<{
+    account: LedgerAccountResponseDto;
+    created: boolean;
+    replayed: boolean;
+  }> {
     if (!rootTypeOf(dto.accountType)) {
       throw new ServiceError(
         ACCOUNT_ERRORS.ACCOUNT_TYPE_NOT_FOUND,
@@ -211,11 +267,17 @@ export class LedgerAccountsService {
     if (dto.parentId !== undefined && dto.parentId !== null) {
       await this.assertParentAllowed(dto.accountType, dto.parentId);
     }
-    const { recordId, created } = await this.externalIds.createOnce({
+    let logged: number | null = null;
+    const { recordId, created, replayed } = await this.externalIds.createOnce({
       kind: ExtRecordKind.Account,
       externalId: dto.externalId,
-      create: (trx) =>
-        this.createInTransaction(
+      body: dto,
+      describe: async (id) => ({
+        state: 'live' as const,
+        version: (await this.tree.get(id))?.version ?? 1,
+      }),
+      create: async (trx) => {
+        const id = await this.createInTransaction(
           {
             name: dto.name,
             code: dto.code ?? null,
@@ -224,10 +286,15 @@ export class LedgerAccountsService {
             metadata: dto.metadata,
           },
           trx,
-        ),
+        );
+        logged = await this.logAccount('create', id, null, trx, dto.code);
+        return id;
+      },
       read: async (id) => id,
     });
-    return { account: await this.get(recordId), created };
+    const account = await this.get(recordId);
+    if (created) await this.audit.finish(logged, account);
+    return { account, created, replayed };
   }
 
   /**
@@ -257,8 +324,8 @@ export class LedgerAccountsService {
         : 'other-current-liability'
       : parent.accountType;
 
-    const accountId = await this.uow.withTransaction((trx) =>
-      this.createInTransaction(
+    const [accountId, logged] = await this.uow.withTransaction(async (trx) => {
+      const id = await this.createInTransaction(
         {
           name: dto.name,
           code: dto.code ?? null,
@@ -267,9 +334,12 @@ export class LedgerAccountsService {
           metadata,
         },
         trx,
-      ),
-    );
-    return this.get(accountId);
+      );
+      return [id, await this.logAccount('create', id, null, trx, dto.code)];
+    });
+    const account = await this.get(accountId);
+    await this.audit.finish(logged, account);
+    return account;
   }
 
   /**
@@ -288,35 +358,63 @@ export class LedgerAccountsService {
       changes.code = dto.code === '' ? null : dto.code;
     if (dto.parentId !== undefined) {
       if (dto.parentId !== null) {
+        if ((await this.tree.get(accountId))?.isTypeRoot) {
+          throw new ServiceError(
+            ACCOUNT_ERRORS.ACCOUNT_IS_TYPE_ROOT,
+            'The account is a type root and cannot be moved under another account.',
+            { accountIds: [accountId] },
+          );
+        }
         await this.assertParentAllowed(account.accountType, dto.parentId);
         await this.assertNotCircular(accountId, dto.parentId);
       }
       changes.parentAccountId = dto.parentId;
     }
-    await this.uow.withTransaction(async (trx) => {
-      await this.tree.update(accountId, changes, trx);
-      await this.metadata.set(
-        ExtRecordKind.Account,
-        accountId,
-        dto.metadata,
-        trx,
-      );
-    });
-    return this.get(accountId);
+    const version = requireVersion(dto.version);
+    const before = await this.get(accountId);
+    const logged = await refusingStale(
+      () =>
+        this.uow.withTransaction(async (trx) => {
+          await raiseVersion(trx, TREE_TABLE, { accountId }, version);
+          await this.tree.update(accountId, changes, trx);
+          await this.metadata.set(
+            ExtRecordKind.Account,
+            accountId,
+            dto.metadata,
+            trx,
+          );
+          return this.logAccount('edit', accountId, before, trx);
+        }),
+      () => this.get(accountId),
+    );
+    const after = await this.get(accountId);
+    await this.audit.finish(logged, after);
+    return after;
   }
 
   /**
    * Deletes an account that has no postings and no children and is not one
    * Bigcapital or the extension depends on.
    */
-  public async delete(accountId: number): Promise<void> {
+  public async delete(
+    accountId: number,
+    expected?: number | string | null,
+  ): Promise<void> {
     await this.nodeOrThrow(accountId);
+    const version = requireVersion(expected);
     const account = await this.accountRowOrThrow(accountId);
     const [nodes, posted, helperIds] = await Promise.all([
       this.tree.list(),
       this.ledgerRows.postedAccountIds(),
       this.helperAccountIds(),
     ]);
+    if (nodes.find((node) => node.accountId === accountId)?.isTypeRoot) {
+      throw new ServiceError(
+        ACCOUNT_ERRORS.ACCOUNT_IS_TYPE_ROOT,
+        'The account is a type root and cannot be deleted.',
+        { accountIds: [accountId] },
+      );
+    }
     if (this.isProtected(account, helperIds)) {
       throw new ServiceError(
         ACCOUNT_ERRORS.ACCOUNT_PREDEFINED,
@@ -353,13 +451,106 @@ export class LedgerAccountsService {
       );
     }
     const deleteAccount = await this.locator.resolve(DeleteAccount);
+    // The account as it stood, kept by the log: once deleted it is read no more.
+    const before = await this.get(accountId);
 
-    await this.uow.withTransaction(async (trx) => {
-      await deleteAccount.deleteAccount(accountId, trx);
-      await this.tree.remove(accountId, trx);
-      await this.metadata.remove(ExtRecordKind.Account, accountId, trx);
-      await this.externalIds.release(ExtRecordKind.Account, accountId, trx);
-    });
+    await refusingStale(
+      () =>
+        this.uow.withTransaction(async (trx) => {
+          await raiseVersion(trx, TREE_TABLE, { accountId }, version);
+          await this.logAccount('delete', accountId, before, trx);
+          await deleteAccount.deleteAccount(accountId, trx);
+          await this.tree.remove(accountId, trx);
+          await this.metadata.remove(ExtRecordKind.Account, accountId, trx);
+          // The account's external id stays its own: it is not used again.
+          await this.externalIds.markDeleted(
+            ExtRecordKind.Account,
+            accountId,
+            trx,
+          );
+        }),
+      () => this.get(accountId),
+    );
+  }
+
+  /**
+   * Archives an account, or restores it. An archived account takes no new
+   * line and is left out of pickers; its history and its balance stay on
+   * every report. As in Bigcapital, the accounts beneath it go with it, both
+   * ways. A type root, and an account documents or the extension post to by
+   * role, cannot be archived; nor can an account above one.
+   */
+  public async setArchived(
+    accountId: number,
+    archived: boolean,
+    expected?: number | null,
+  ): Promise<LedgerAccountResponseDto> {
+    await this.nodeOrThrow(accountId);
+    const version = requireVersion(expected);
+    const [nodes, accounts, helperIds] = await Promise.all([
+      this.tree.list(),
+      this.accountRows(),
+      this.helperAccountIds(),
+    ]);
+    const ids: number[] = [];
+    const walk = (id: number) => {
+      if (ids.includes(id)) return;
+      ids.push(id);
+      nodes
+        .filter((node) => node.parentAccountId === id)
+        .forEach((node) => walk(node.accountId));
+    };
+    walk(accountId);
+
+    if (archived) {
+      const nodeById = new Map(nodes.map((node) => [node.accountId, node]));
+      const rowById = new Map(accounts.map((row) => [Number(row.id), row]));
+      const roots = ids.filter((id) => nodeById.get(id)?.isTypeRoot);
+      const kept = ids.filter((id) =>
+        this.isProtected(rowById.get(id), helperIds),
+      );
+      if (roots.length > 0) {
+        throw new ServiceError(
+          ACCOUNT_ERRORS.ACCOUNT_IS_TYPE_ROOT,
+          'The account is a type root and cannot be archived.',
+          { accountIds: roots },
+        );
+      }
+      if (kept.length > 0) {
+        throw new ServiceError(
+          ACCOUNT_ERRORS.ACCOUNT_PREDEFINED,
+          kept.includes(accountId)
+            ? 'The account is predefined and cannot be archived.'
+            : 'An account beneath this one is predefined, so it cannot be archived.',
+          { accountIds: kept },
+        );
+      }
+    }
+    const activate = await this.locator.resolve(ActivateAccount);
+    const before = await this.get(accountId);
+
+    // Bigcapital switches each account in a transaction of its own, so the
+    // version is checked and raised first, in one of ours.
+    await refusingStale(
+      () =>
+        this.uow.withTransaction((trx) =>
+          raiseVersion(trx, TREE_TABLE, { accountId }, version),
+        ),
+      () => this.get(accountId),
+    );
+
+    // Bigcapital holds the chart flat, so each account is switched by itself.
+    for (const id of ids) {
+      await activate.activateAccount(id, !archived);
+    }
+    // Bigcapital's call runs in a transaction of its own, so the row is
+    // written once it has landed.
+    const logged = await this.uow.withTransaction((trx) =>
+      this.logAccount(archived ? 'archive' : 'restore', accountId, before, trx),
+    );
+    const after = await this.get(accountId);
+    await this.audit.finish(logged, after);
+    return after;
   }
 
   /**
@@ -420,6 +611,46 @@ export class LedgerAccountsService {
         'An account was not found.',
         { accountIds: missing },
         HttpStatus.NOT_FOUND,
+      );
+    }
+  }
+
+  /**
+   * Throws unless every account given can take a line: it is part of the
+   * presented chart, is not a type root and is not archived.
+   * @throws {ServiceError} account_not_found, ACCOUNT_IS_TYPE_ROOT or
+   *   ACCOUNT_ARCHIVED, each with the ids it is about.
+   */
+  public async assertPostable(accountIds: number[]): Promise<void> {
+    const ids = [...new Set(accountIds)];
+    if (ids.length === 0) return;
+    await this.assertPresented(ids);
+
+    const [nodes, accounts] = await Promise.all([
+      this.tree.list(),
+      this.tenantKnex()('accounts').whereIn('id', ids).select('id', 'active'),
+    ]);
+    const rootIds = new Set(
+      nodes.filter((node) => node.isTypeRoot).map((node) => node.accountId),
+    );
+    const roots = ids.filter((id) => rootIds.has(id));
+
+    if (roots.length > 0) {
+      throw new ServiceError(
+        ACCOUNT_ERRORS.ACCOUNT_IS_TYPE_ROOT,
+        'A type root groups accounts and takes no postings. Post to an account beneath it.',
+        { accountIds: roots },
+      );
+    }
+    const archived = accounts
+      .filter((account: any) => !account.active)
+      .map((account: any) => Number(account.id));
+
+    if (archived.length > 0) {
+      throw new ServiceError(
+        ACCOUNT_ERRORS.ACCOUNT_ARCHIVED,
+        'An account is archived and takes no new line. Restore it first.',
+        { accountIds: archived },
       );
     }
   }
@@ -642,6 +873,7 @@ export class LedgerAccountsService {
       'slug',
       'accountType',
       'predefined',
+      'active',
     );
   }
 
@@ -663,19 +895,21 @@ export class LedgerAccountsService {
 
   /**
    * What a ledger read falls back on: the workspace's reporting basis, and
-   * the instant its books start, before which entries are left out unless a
+   * the day its books start, before which entries are left out unless a
    * read asks for them.
    */
   public async ledgerDefaults(): Promise<{
     basis: 'accrual' | 'cash';
-    booksStartAt: string | null;
+    booksStartOn: string | null;
+    fiscalYearStartMonth: number;
   }> {
     const workspace = await this.workspaces.findByOrganization(
       this.cls.get('organizationId'),
     );
     return {
       basis: workspace?.reportingBasis ?? 'accrual',
-      booksStartAt: workspace?.booksStartAt ?? null,
+      booksStartOn: workspace?.booksStartOn ?? null,
+      fiscalYearStartMonth: workspace?.fiscalYearStartMonth ?? 1,
     };
   }
 }

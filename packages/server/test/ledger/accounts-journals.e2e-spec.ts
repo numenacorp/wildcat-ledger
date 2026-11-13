@@ -2,7 +2,9 @@ import request = require('supertest');
 import { randomUUID } from 'crypto';
 import { INestApplication } from '@nestjs/common';
 import {
+  change,
   createTestApp,
+  createTestTags,
   createTestWorkspace,
   dropOrganizations,
   TestWorkspace,
@@ -54,8 +56,9 @@ const chart = () => [
   { code: '6100', name: 'Supplies', account_type: 'expense' },
 ];
 
-const JAN_START = '2031-01-01T06:00:00.000Z';
-const FEB_START = '2031-02-01T06:00:00.000Z';
+const JAN_START = '2031-01-01';
+const JAN_END = '2031-01-31';
+const FEB_START = '2031-02-01';
 
 describe('Ledger extension: accounts, manual journals, balances and the lock', () => {
   let app: INestApplication;
@@ -63,21 +66,18 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
   let other: TestWorkspace;
   let id: Record<string, number>;
   const journals: Record<string, any> = {};
+  /** The body each of the four journals was made with. */
+  const bodies: Record<string, any> = {};
+  let customer: any;
 
   const http = () => request(app.getHttpServer());
   const get = (path: string, query: Record<string, unknown> = {}) =>
     http().get(path).query(query).set(ws.headers());
   const post = (path: string, body: unknown) =>
-    http()
-      .post(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'post', path, ws.headers(), body);
   const put = (path: string, body: unknown) =>
-    http()
-      .put(path)
-      .set(ws.headers())
-      .send(body as any);
-  const del = (path: string) => http().delete(path).set(ws.headers());
+    change(app, 'put', path, ws.headers(), body);
+  const del = (path: string) => change(app, 'delete', path, ws.headers());
 
   const line = (code: string, debit: string, credit: string, extra = {}) => ({
     account_id: id[code],
@@ -85,9 +85,9 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     credit,
     ...extra,
   });
-  const journal = (postedAt: string, entries: unknown[], extra = {}) => ({
+  const journal = (postedOn: string, entries: unknown[], extra = {}) => ({
     external_id: `j:${randomUUID()}`,
-    posted_at: postedAt,
+    posted_on: postedOn,
     entries,
     ...extra,
   });
@@ -101,7 +101,16 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         .filter((a) => a.code)
         .map((a) => [a.code, a.balance]),
     );
+  const error = (res: request.Response) => res.body?.errors?.[0];
   const errorType = (res: request.Response) => res.body?.errors?.[0]?.type;
+  /** A change sent exactly as written: no version is read and added for it. */
+  const bareCall = (method: 'post' | 'put' | 'delete', path: string) =>
+    http()[method](path).set(ws.headers());
+  const journalRows = (journalId: number) =>
+    ws.rows('accounts_transactions', {
+      referenceType: 'Journal',
+      referenceId: journalId,
+    });
 
   beforeAll(async () => {
     app = await createTestApp();
@@ -109,16 +118,24 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     other = await createTestWorkspace(app, { accounts: chart() });
 
     id = Object.fromEntries((await accounts()).map((a) => [a.code, a.id]));
+    customer = (await post('/ledger/customers', { external_id: 'c-j4' })).body
+      .data;
+    // A journal names tags that exist: J2's are made before it.
+    await createTestTags(app, ws.headers(), 'Location', ['North', 'South']);
+    await createTestTags(app, ws.headers(), 'Project', ['Alpha']);
 
     const create = async (key: string, body: unknown) => {
       const res = await post('/ledger/manual-journals', body);
       expect(res.status).toBe(201);
+      // A first create is no retry, and says nothing of one.
+      expect(res.body).not.toHaveProperty('replayed');
       journals[key] = res.body.data;
+      bodies[key] = body;
     };
     await create(
       'J1',
       journal(
-        '2031-01-15T18:00:00Z',
+        '2031-01-15',
         [line('1010', '1000.00', '0'), line('3000', '0', '1000.00')],
         {
           description: 'Owner funds the business',
@@ -130,7 +147,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     );
     await create(
       'J2',
-      journal('2031-01-20T18:00:00Z', [
+      journal('2031-01-20', [
         line('6000', '250.10', '0', {
           note: 'January rent',
           external_id: 'line-rent',
@@ -147,15 +164,15 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     );
     await create(
       'J3',
-      journal('2031-02-01T05:59:59Z', [
+      journal('2031-01-31', [
         line('1020', '50.00', '0'),
         line('1010', '0', '50.00'),
       ]),
     );
     await create(
       'J4',
-      journal('2031-02-01T06:00:00Z', [
-        line('1200', '400.00', '0'),
+      journal('2031-02-01', [
+        line('1200', '400.00', '0', { customer_id: customer.id }),
         line('4000', '0', '400.00'),
       ]),
     );
@@ -196,11 +213,15 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         name: 'Rent',
         account_type: 'expense',
         parent_id: null,
+        is_type_root: false,
+        active: true,
         external_id: null,
         metadata: { a: 1, b: 1, camelKey: true },
         deletable: false,
         balance: '250.10',
         own_balance: '250.10',
+        // As the chart made it: nothing has changed it since.
+        version: 1,
       });
       expect(operating.parent_id).toBe(id['1000']);
       expect(operating.account_type).toBe('bank');
@@ -228,8 +249,8 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(parent.own_balance).toBe('0.00');
     });
 
-    it('for January: the last second of 31 January is in, midnight is out', async () => {
-      expect(await balances({ from: JAN_START, to: FEB_START })).toEqual({
+    it('for January: 31 January is in, 1 February is out', async () => {
+      expect(await balances({ from: JAN_START, to: JAN_END })).toEqual({
         '1000': '700.00',
         '1010': '650.00',
         '1020': '50.00',
@@ -242,7 +263,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       });
     });
 
-    it('from 1 February: only the journal at midnight', async () => {
+    it('from 1 February: only the journal of that day', async () => {
       const feb = await balances({ from: FEB_START });
       expect(feb['1200']).toBe('400.00');
       expect(feb['4000']).toBe('-400.00');
@@ -276,10 +297,10 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       );
       expect([feb.opening_balance, feb.balance]).toEqual(['0.00', '400.00']);
 
-      // From J2's own instant: J2 is in the range, so only J1 is before it.
-      const fromJ2 = (
-        await accounts({ from: '2031-01-20T18:00:00Z', to: FEB_START })
-      ).find((a) => a.code === '1010');
+      // From J2's own day: J2 is in the range, so only J1 is before it.
+      const fromJ2 = (await accounts({ from: '2031-01-20', to: JAN_END })).find(
+        (a) => a.code === '1010',
+      );
       expect([fromJ2.opening_balance, fromJ2.balance]).toEqual([
         '1000.00',
         '-350.00',
@@ -291,7 +312,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     });
 
     it('carries no opening balance when no start is sent', async () => {
-      const [first] = await accounts({ to: FEB_START });
+      const [first] = await accounts({ to: JAN_END });
       expect(first).not.toHaveProperty('opening_balance');
       expect(first).not.toHaveProperty('own_opening_balance');
     });
@@ -323,11 +344,12 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         id: expect.any(Number),
         external_id: expect.stringMatching(/^j:/),
         journal_number: 'JE-000002',
-        posted_at: '2031-01-20T18:00:00.000Z',
+        posted_on: '2031-01-20',
         description: null,
         reference: null,
         created_by: null,
         metadata: null,
+        version: 1,
         entries: [
           {
             id: expect.any(Number),
@@ -337,6 +359,10 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
             debit: '250.10',
             credit: '0.00',
             note: 'January rent',
+            customer_id: null,
+            customer_external_id: null,
+            vendor_id: null,
+            vendor_external_id: null,
             tracking: [
               {
                 id: expect.any(Number),
@@ -354,6 +380,10 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
             debit: '49.90',
             credit: '0.00',
             note: null,
+            customer_id: null,
+            customer_external_id: null,
+            vendor_id: null,
+            vendor_external_id: null,
             tracking: [
               {
                 id: expect.any(Number),
@@ -377,6 +407,10 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
             debit: '0.00',
             credit: '300.00',
             note: null,
+            customer_id: null,
+            customer_external_id: null,
+            vendor_id: null,
+            vendor_external_id: null,
             tracking: [],
           },
         ],
@@ -401,19 +435,19 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(dayOf('J4')).toBe('2031-02-01');
     });
 
-    it('puts the placeholder customer on a receivable line that names no one', async () => {
-      const settings = Object.fromEntries(
-        (await ws.rows('ext_settings')).map((s) => [
-          s.key,
-          JSON.parse(s.value),
-        ]),
-      );
+    it('puts the customer named on the receivable line, and answers it on the line', async () => {
       const [row] = await ws.rows('accounts_transactions', {
         referenceType: 'Journal',
         referenceId: journals.J4.id,
         accountId: id['1200'],
       });
-      expect(row.contactId).toBe(settings.placeholder_customer_id);
+      expect(row.contactId).toBe(customer.id);
+      expect(
+        journals.J4.entries.map((e: any) => [e.customer_id, e.vendor_id]),
+      ).toEqual([
+        [customer.id, null],
+        [null, null],
+      ]);
     });
 
     it('is read back and listed, oldest first', async () => {
@@ -435,8 +469,8 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('is listed by a range that includes both of its ends', async () => {
       const list = await get('/ledger/manual-journals', {
-        from: '2031-01-20T18:00:00Z',
-        to: '2031-02-01T05:59:59Z',
+        from: '2031-01-20',
+        to: '2031-01-31',
       }).expect(200);
       expect(list.body.data.map((j: any) => j.id)).toEqual([
         journals.J2.id,
@@ -465,27 +499,33 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       });
     });
 
-    it('a repeat of its external id replaces it with the new body, under the same id', async () => {
-      // First: Dr 6000 9.00 / Cr 1010 9.00. Rent is then 250.10 + 9.00.
+    it('a repeat of its external id is a retry with the same body, and refused with another', async () => {
+      // Dr 6000 9.00 / Cr 1010 9.00. Rent is then 250.10 + 9.00, and the
+      // operating account 650.00 - 9.00.
       const body = journal(
-        '2031-01-25T18:00:00Z',
+        '2031-01-25',
         [line('6000', '9.00', '0'), line('1010', '0', '9.00')],
         { description: 'first' },
       );
       const first = await post('/ledger/manual-journals', body);
       expect(first.status).toBe(201);
-      expect((await balances())['6000']).toBe('259.10');
+      expect(first.body).not.toHaveProperty('replayed');
+      expect(first.body.data.version).toBe(1);
+      const books = { '6000': '259.10', '6100': '49.90', '1010': '641.00' };
+      expect(await balances()).toMatchObject(books);
 
-      // The same body again changes nothing.
+      // The same body again is a retry: answered with the journal, nothing written.
       const same = await post('/ledger/manual-journals', body);
       expect(same.status).toBe(200);
-      expect(same.body.data).toEqual(first.body.data);
+      expect(same.body).toEqual({ data: first.body.data, replayed: true });
+      expect(await balances()).toMatchObject(books);
 
       // Another body: Dr 6100 4.00, Dr 6000 1.50 / Cr 1010 5.50, a day later.
-      const replaced = await post(
+      // It does not replace the journal: it is refused, naming it.
+      const other = await post(
         '/ledger/manual-journals',
         journal(
-          '2031-01-26T18:00:00Z',
+          '2031-01-26',
           [
             line('6100', '4.00', '0'),
             line('6000', '1.50', '0'),
@@ -494,36 +534,29 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
           { external_id: body.external_id, description: 'second' },
         ),
       );
-      expect(replaced.status).toBe(200);
-      expect(replaced.body.data).toMatchObject({
-        id: first.body.data.id,
-        external_id: body.external_id,
-        journal_number: first.body.data.journal_number,
-        posted_at: '2031-01-26T18:00:00.000Z',
+      expect(other.status).toBe(409);
+      expect(errorType(other)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(other).payload).toEqual({
+        kind: 'manual_journal',
+        externalId: body.external_id,
+        recordId: first.body.data.id,
+        state: 'live',
+        version: 1,
+      });
+      // One changed field is another body too.
+      const described = await post('/ledger/manual-journals', {
+        ...body,
         description: 'second',
       });
-      expect(
-        replaced.body.data.entries.map((e: any) => [
-          e.account.code,
-          e.debit,
-          e.credit,
-        ]),
-      ).toEqual([
-        ['6100', '4.00', '0.00'],
-        ['6000', '1.50', '0.00'],
-        ['1010', '0.00', '5.50'],
-      ]);
-      // 250.10 + 1.50, 49.90 + 4.00, 650.00 - 5.50.
-      const after = await balances();
-      expect(after['6000']).toBe('251.60');
-      expect(after['6100']).toBe('53.90');
-      expect(after['1010']).toBe('644.50');
-      expect(
-        await ws.rows('accounts_transactions', {
-          referenceType: 'Journal',
-          referenceId: first.body.data.id,
-        }),
-      ).toHaveLength(3);
+      expect(described.status).toBe(409);
+      expect(errorType(described)).toBe('EXTERNAL_ID_IN_USE');
+
+      // The journal is as it was made, and so are the books: 250.10 + 9.00,
+      // 49.90 untouched, 650.00 - 9.00.
+      const read = await get(`/ledger/manual-journals/${first.body.data.id}`);
+      expect(read.body.data).toEqual(first.body.data);
+      expect(await balances()).toMatchObject(books);
+      expect(await journalRows(first.body.data.id)).toHaveLength(2);
       expect(
         await ws.rows('ext_external_ids', { externalId: body.external_id }),
       ).toHaveLength(1);
@@ -531,50 +564,85 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       await del(`/ledger/manual-journals/${first.body.data.id}`).expect(200);
     });
 
-    it('takes a display name for a tag when its option is new, and keeps it', async () => {
-      const tagged = (optionName: string) =>
-        journal('2031-01-28T18:00:00Z', [
-          line('6000', '1.00', '0', {
-            tracking: [
-              { category: 'Site', option: 'north', option_name: optionName },
-            ],
-          }),
+    it('refuses a tag whose category or option is new, and makes neither', async () => {
+      const tagged = (tracking: unknown) =>
+        journal('2031-01-28', [
+          line('6000', '1.00', '0', { tracking: [tracking] }),
           line('1010', '0', '1.00'),
         ]);
-      const first = await post('/ledger/manual-journals', tagged('North Yard'));
-      expect(first.status).toBe(201);
-      expect(first.body.data.entries[0].tracking).toEqual([
-        {
-          id: expect.any(Number),
-          category: 'Site',
-          option: 'north',
-          option_name: 'North Yard',
-        },
-      ]);
-      // The option exists now: another name for it is not taken.
-      const second = await post('/ledger/manual-journals', tagged('Elsewhere'));
-      expect(second.body.data.entries[0].tracking).toEqual([
-        {
-          id: expect.any(Number),
-          category: 'Site',
-          option: 'north',
-          option_name: 'North Yard',
-        },
-      ]);
-      const lines = await get(`/ledger/accounts/${id['6000']}/lines`);
-      expect(lines.body.data[0].tracking).toEqual([
-        { category: 'Site', option: 'north', option_name: 'North Yard' },
-      ]);
+      const tags = async () =>
+        (await get('/ledger/tracking-categories').expect(200)).body.data.map(
+          (c: any) => [
+            c.name,
+            c.options.map((o: any) => [o.name, o.display_name]),
+          ],
+        );
+      const made = [
+        [
+          'Location',
+          [
+            ['North', 'North'],
+            ['South', 'South'],
+          ],
+        ],
+        ['Project', [['Alpha', 'Alpha']]],
+      ];
+      const before = await balances();
+      const count = (await ws.rows('manual_journals')).length;
+      expect(await tags()).toEqual(made);
 
-      await del(`/ledger/manual-journals/${first.body.data.id}`).expect(200);
-      await del(`/ledger/manual-journals/${second.body.data.id}`).expect(200);
+      // A display name sent with the tag makes no option of that name.
+      const category = await post(
+        '/ledger/manual-journals',
+        tagged({
+          category: 'Site',
+          option: 'north',
+          option_name: 'North Yard',
+        }),
+      );
+      expect(category.status).toBe(400);
+      expect(error(category).type).toBe('TRACKING_CATEGORY_NOT_FOUND');
+      expect(error(category).payload).toEqual({ category: 'Site' });
+
+      const option = await post(
+        '/ledger/manual-journals',
+        tagged({ category: 'Location', option: 'East', option_name: 'East' }),
+      );
+      expect(option.status).toBe(400);
+      expect(error(option).type).toBe('TRACKING_OPTION_NOT_FOUND');
+      expect(error(option).payload).toEqual({
+        category: 'Location',
+        option: 'East',
+      });
+
+      expect(await tags()).toEqual(made);
+      expect(await balances()).toEqual(before);
+      expect(await ws.rows('manual_journals')).toHaveLength(count);
+
+      // An option that exists keeps its name: one sent with a tag is not taken.
+      const known = await post(
+        '/ledger/manual-journals',
+        tagged({ category: 'Location', option: 'North', option_name: 'Up' }),
+      );
+      expect(known.status).toBe(201);
+      expect(known.body.data.entries[0].tracking).toEqual([
+        {
+          id: expect.any(Number),
+          category: 'Location',
+          option: 'North',
+          option_name: 'North',
+        },
+      ]);
+      expect(await tags()).toEqual(made);
+
+      await del(`/ledger/manual-journals/${known.body.data.id}`).expect(200);
     });
 
     it('accepts a journal of zero amounts, which moves no balance', async () => {
       const before = await balances();
       const res = await post(
         '/ledger/manual-journals',
-        journal('2031-01-27T18:00:00Z', [
+        journal('2031-01-27', [
           line('6000', '0', '0'),
           line('1010', '0.00', '0.00'),
         ]),
@@ -592,7 +660,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     });
 
     it('eight simultaneous creates of one external id make one journal', async () => {
-      const body = journal('2031-04-01T17:00:00Z', [
+      const body = journal('2031-04-01', [
         line('6000', '1.00', '0'),
         line('1010', '0', '1.00'),
       ]);
@@ -602,6 +670,11 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(results.map((r) => r.status).sort()).toEqual([
         200, 200, 200, 200, 200, 200, 200, 201,
       ]);
+      // The seven that made nothing say so; the one that made it does not.
+      expect(results.map((r) => [r.status, r.body.replayed]).sort()).toEqual([
+        ...Array.from({ length: 7 }, () => [200, true]),
+        [201, undefined],
+      ]);
       const journalId = results[0].body.data.id;
       expect(new Set(results.map((r) => r.body.data.id)).size).toBe(1);
       expect(
@@ -610,6 +683,8 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
           referenceId: journalId,
         }),
       ).toHaveLength(2);
+      // One journal of 1.00 to rent, not eight: 250.10 + 1.00.
+      expect((await balances())['6000']).toBe('251.10');
 
       await del(`/ledger/manual-journals/${journalId}`).expect(200);
     });
@@ -627,7 +702,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('debits that differ from credits, with both totals in the message', async () => {
       const res = await refused(
-        journal('2031-03-01T18:00:00Z', [
+        journal('2031-03-01', [
           line('6000', '100.00', '0'),
           line('1010', '0', '99.99'),
         ]),
@@ -640,7 +715,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('a difference of a thousandth, which rounding to cents would hide', async () => {
       await refused(
-        journal('2031-03-01T18:00:00Z', [
+        journal('2031-03-01', [
           line('6000', '100.001', '0'),
           line('1010', '0', '100.00'),
         ]),
@@ -650,7 +725,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('a line that is both a debit and a credit', async () => {
       await refused(
-        journal('2031-03-01T18:00:00Z', [
+        journal('2031-03-01', [
           line('6000', '5.00', '5.00'),
           line('1010', '0', '0'),
         ]),
@@ -660,7 +735,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('an account that does not exist, and one outside the presented chart', async () => {
       await refused(
-        journal('2031-03-01T18:00:00Z', [
+        journal('2031-03-01', [
           { account_id: 99999999, debit: '1.00', credit: '0' },
           line('1010', '0', '1.00'),
         ]),
@@ -668,7 +743,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       );
       const [hidden] = await ws.rows('accounts', { slug: 'office-expenses' });
       await refused(
-        journal('2031-03-01T18:00:00Z', [
+        journal('2031-03-01', [
           { account_id: hidden.id, debit: '1.00', credit: '0' },
           line('1010', '0', '1.00'),
         ]),
@@ -678,7 +753,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('malformed amounts, one line, an unknown field', async () => {
       const good = [line('6000', '1.00', '0'), line('1010', '0', '1.00')];
-      const at = '2031-03-01T18:00:00Z';
+      const at = '2031-03-01';
 
       await refused(journal(at, [line('6000', '1.2345', '0'), good[1]]));
       await refused(journal(at, [line('6000', '-1.00', '0'), good[1]]));
@@ -697,7 +772,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     beforeAll(async () => {
       const created = await post(
         '/ledger/manual-journals',
-        journal('2031-05-10T17:00:00Z', [
+        journal('2031-05-10', [
           line('6000', '10.00', '0'),
           line('6100', '20.00', '0'),
           line('1010', '0', '30.00'),
@@ -706,8 +781,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       original = created.body.data;
 
       const res = await put(`/ledger/manual-journals/${original.id}`, {
-        external_id: `${original.external_id}:moved`,
-        posted_at: '2031-05-11T17:00:00Z',
+        posted_on: '2031-05-11',
         description: 'Edited',
         entries: [
           line('6000', '15.00', '0'),
@@ -727,7 +801,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     it('keeps the id and number, and takes the new instant and lines', () => {
       expect(edited.id).toBe(original.id);
       expect(edited.journal_number).toBe(original.journal_number);
-      expect(edited.posted_at).toBe('2031-05-11T17:00:00.000Z');
+      expect(edited.posted_on).toBe('2031-05-11');
       expect(edited.description).toBe('Edited');
       expect(
         edited.entries.map((e: any) => [e.account.code, e.debit, e.credit]),
@@ -764,25 +838,92 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(net('1010')).toBeCloseTo(-40, 3);
     });
 
-    it('moves the external id, and frees the old one', async () => {
-      expect(edited.external_id).toBe(`${original.external_id}:moved`);
+    it('keeps its external id, which an edit may not change or remove and no other journal may take', async () => {
+      // The edit named no external id: the journal has the one it was made with.
+      expect(edited.external_id).toBe(original.external_id);
+      // Made at 1; the edit is its one change.
+      expect([original.version, edited.version]).toEqual([1, 2]);
 
+      const body = {
+        posted_on: '2031-05-11',
+        description: 'Edited',
+        entries: [
+          line('6000', '15.00', '0'),
+          line('6100', '20.00', '0'),
+          line('1020', '5.00', '0'),
+          line('1010', '0', '40.00'),
+        ],
+      };
+      for (const externalId of [`${original.external_id}:moved`, null]) {
+        const res = await put(`/ledger/manual-journals/${original.id}`, {
+          ...body,
+          external_id: externalId,
+        });
+        expect(res.status).toBe(400);
+        expect(errorType(res)).toBe('EXTERNAL_ID_FIXED');
+        expect(error(res).payload).toEqual({
+          externalId: original.external_id,
+        });
+      }
+      // Neither refused edit wrote anything.
+      const read = await get(`/ledger/manual-journals/${original.id}`);
+      expect(read.body.data).toEqual(edited);
+
+      // The id is the edited journal's still: a create under it with another
+      // body makes no journal.
+      const count = (await ws.rows('manual_journals')).length;
       const reuse = await post(
         '/ledger/manual-journals',
         journal(
-          '2031-05-12T17:00:00Z',
+          '2031-05-12',
           [line('6000', '1.00', '0'), line('1010', '0', '1.00')],
           { external_id: original.external_id },
         ),
       );
-      expect(reuse.status).toBe(201);
-      expect(reuse.body.data.id).not.toBe(original.id);
-      await del(`/ledger/manual-journals/${reuse.body.data.id}`).expect(200);
+      expect(reuse.status).toBe(409);
+      expect(errorType(reuse)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(reuse).payload).toEqual({
+        kind: 'manual_journal',
+        externalId: original.external_id,
+        recordId: original.id,
+        state: 'live',
+        version: 2,
+      });
+      expect(await ws.rows('manual_journals')).toHaveLength(count);
+    });
+
+    it('an edit gives an external id to a journal that has none', async () => {
+      const body = {
+        posted_on: '2031-05-13',
+        entries: [line('6000', '1.00', '0'), line('1010', '0', '1.00')],
+      };
+      const made = await post('/ledger/manual-journals', body);
+      expect(made.status).toBe(201);
+      expect(made.body.data.external_id).toBeNull();
+
+      const given = `j:${randomUUID()}`;
+      const named = await put(`/ledger/manual-journals/${made.body.data.id}`, {
+        ...body,
+        external_id: given,
+      });
+      expect(named.status).toBe(200);
+      expect([named.body.data.external_id, named.body.data.version]).toEqual([
+        given,
+        2,
+      ]);
+      const changed = await put(
+        `/ledger/manual-journals/${made.body.data.id}`,
+        { ...body, external_id: `j:${randomUUID()}` },
+      );
+      expect(changed.status).toBe(400);
+      expect(errorType(changed)).toBe('EXTERNAL_ID_FIXED');
+
+      await del(`/ledger/manual-journals/${made.body.data.id}`).expect(200);
     });
 
     it('refuses an edit that does not balance, and changes nothing', async () => {
       const res = await put(`/ledger/manual-journals/${original.id}`, {
-        posted_at: '2031-05-11T17:00:00Z',
+        posted_on: '2031-05-11',
         entries: [line('6000', '1.00', '0'), line('1010', '0', '2.00')],
       });
       expect(res.status).toBe(400);
@@ -795,7 +936,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     it('answers an edit of a journal that does not exist as not found', async () => {
       const res = await put('/ledger/manual-journals/99999999', {
-        posted_at: '2031-05-11T17:00:00Z',
+        posted_on: '2031-05-11',
         entries: [line('6000', '1.00', '0'), line('1010', '0', '1.00')],
       });
       expect(res.status).toBe(404);
@@ -804,10 +945,10 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
   });
 
   describe('deleting a journal', () => {
-    it('removes it, its ledger rows and its companion rows; its external id brings it back under the same id', async () => {
+    it('removes it, its ledger rows and its companion rows; its external id is never used again', async () => {
       const before = await balances();
       const body = journal(
-        '2031-06-01T17:00:00Z',
+        '2031-06-01',
         [
           line('6000', '77.00', '0', { external_id: 'gone-line' }),
           line('1010', '0', '77.00'),
@@ -857,54 +998,61 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       });
       expect(listed.body.data).toHaveLength(0);
 
-      // Its external id brings it back under the same id, with the new body:
-      // Dr 6100 5.00 / Cr 1010 5.00.
-      const again = await post(
-        '/ledger/manual-journals',
+      // Its external id is spent. It brings nothing back and makes no new
+      // journal: not with another body (Dr 6100 5.00 / Cr 1010 5.00), and
+      // not with the body the journal was made with.
+      const count = (await ws.rows('manual_journals')).length;
+      const bodiesSent = [
         journal(
-          '2031-06-02T17:00:00Z',
+          '2031-06-02',
           [line('6100', '5.00', '0'), line('1010', '0', '5.00')],
           { external_id: body.external_id },
         ),
-      );
-      expect(again.status).toBe(200);
-      expect(again.body.data.id).toBe(created.id);
-      expect(again.body.data.external_id).toBe(body.external_id);
-      expect(again.body.data.journal_number).not.toBe(created.journal_number);
-      expect(again.body.data.posted_at).toBe('2031-06-02T17:00:00.000Z');
-      expect(again.body.data.metadata).toBeNull();
-      expect((await balances())['6100']).toBe('54.90');
-      expect((await balances())['6000']).toBe('250.10');
-
-      const rows = await ws.rows('accounts_transactions', {
-        referenceType: 'Journal',
-        referenceId: created.id,
+        body,
+      ];
+      for (const sent of bodiesSent) {
+        const again = await post('/ledger/manual-journals', sent);
+        expect(again.status).toBe(409);
+        expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+        expect(error(again).payload).toEqual({
+          kind: 'manual_journal',
+          externalId: body.external_id,
+          recordId: created.id,
+          state: 'deleted',
+          version: null,
+        });
+      }
+      // In bulk too, and the journal sent beside it is not made either.
+      const beside = journal('2031-06-02', [
+        line('6100', '5.00', '0'),
+        line('1010', '0', '5.00'),
+      ]);
+      const bulk = await post('/ledger/manual-journals/bulk', {
+        journals: [beside, body],
       });
-      expect(rows).toHaveLength(2);
-      expect(await ws.rows('manual_journals', { id: created.id })).toHaveLength(
-        1,
-      );
+      expect(bulk.status).toBe(409);
+      expect(errorType(bulk)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(bulk).payload).toMatchObject({
+        recordId: created.id,
+        state: 'deleted',
+      });
       expect(
-        await ws.rows('manual_journals_entries', {
-          manualJournalId: created.id,
-        }),
-      ).toHaveLength(2);
-      const reread = await get(`/ledger/manual-journals/${created.id}`).expect(
-        200,
-      );
-      expect(reread.body.data).toEqual(again.body.data);
+        await ws.rows('ext_external_ids', { externalId: beside.external_id }),
+      ).toHaveLength(0);
 
-      // It can be edited and deleted like any other, and brought back again.
-      await put(`/ledger/manual-journals/${created.id}`, {
-        posted_at: '2031-06-02T17:00:00Z',
-        entries: [line('6100', '6.00', '0'), line('1010', '0', '6.00')],
-      }).expect(200);
-      expect((await balances())['6100']).toBe('55.90');
-      await del(`/ledger/manual-journals/${created.id}`).expect(200);
-      const third = await post('/ledger/manual-journals', body);
-      expect(third.status).toBe(200);
-      expect(third.body.data.id).toBe(created.id);
-      await del(`/ledger/manual-journals/${created.id}`).expect(200);
+      expect(await ws.rows('manual_journals')).toHaveLength(count);
+      expect(await ws.rows('manual_journals', { id: created.id })).toHaveLength(
+        0,
+      );
+      expect(await journalRows(created.id)).toHaveLength(0);
+      expect((await get(`/ledger/manual-journals/${created.id}`)).status).toBe(
+        404,
+      );
+      // The id is held by the one row it always had.
+      expect(
+        await ws.rows('ext_external_ids', { externalId: body.external_id }),
+      ).toHaveLength(1);
+      // 6000 is back at 250.10 and 6100 never left 49.90.
       expect(await balances()).toEqual(before);
     });
 
@@ -918,7 +1066,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(account.deletable).toBe(true);
 
       const created = await post('/ledger/manual-journals', {
-        posted_at: '2031-06-03T17:00:00Z',
+        posted_on: '2031-06-03',
         entries: [
           { account_id: account.id, debit: '3.00', credit: '0' },
           line('1010', '0', '3.00'),
@@ -944,14 +1092,14 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         })
       ).body.data;
       const created = await post('/ledger/manual-journals', {
-        posted_at: '2031-06-04T17:00:00Z',
+        posted_on: '2031-06-04',
         entries: [
           { account_id: account.id, debit: '2.00', credit: '0' },
           line('1010', '0', '2.00'),
         ],
       });
       await put(`/ledger/manual-journals/${created.body.data.id}`, {
-        posted_at: '2031-06-04T17:00:00Z',
+        posted_on: '2031-06-04',
         entries: [line('6000', '2.00', '0'), line('1010', '0', '2.00')],
       }).expect(200);
       await del(`/ledger/manual-journals/${created.body.data.id}`).expect(200);
@@ -962,18 +1110,123 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     });
   });
 
+  describe('the version of a journal', () => {
+    // One journal on 10 June: Dr 6000 12.00 / Cr 1010 12.00, then edited to
+    // 15.00. Rent is 250.10 without it, 262.10 with it, 265.10 once edited.
+    let made: any;
+    const body = (amount: string, extra = {}) => ({
+      posted_on: '2031-06-10',
+      metadata: { sourceDoc: 'V-1' },
+      entries: [line('6000', amount, '0'), line('1010', '0', amount)],
+      ...extra,
+    });
+    const read = async () =>
+      (await get(`/ledger/manual-journals/${made.id}`)).body.data;
+    const rent = async () => (await balances())['6000'];
+
+    beforeAll(async () => {
+      const res = await post(
+        '/ledger/manual-journals',
+        body('12.00', { external_id: `j:${randomUUID()}` }),
+      );
+      expect(res.status).toBe(201);
+      made = res.body.data;
+    });
+
+    it('starts at 1, and an edit made from it lands and raises it by one', async () => {
+      expect(made.version).toBe(1);
+      expect(await rent()).toBe('262.10');
+
+      const res = await put(
+        `/ledger/manual-journals/${made.id}`,
+        body('15.00', { version: 1 }),
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.data.version).toBe(2);
+      expect(await read()).toEqual(res.body.data);
+      expect(await rent()).toBe('265.10');
+    });
+
+    it('an edit made from an old version is refused with the journal as it stands, and writes nothing', async () => {
+      const current = await read();
+      const res = await put(
+        `/ledger/manual-journals/${made.id}`,
+        body('99.00', { version: 1 }),
+      );
+      expect(res.status).toBe(409);
+      expect(errorType(res)).toBe('STALE_VERSION');
+      expect(error(res).payload).toEqual({ current });
+
+      expect(await read()).toEqual(current);
+      expect(current.version).toBe(2);
+      expect(await rent()).toBe('265.10');
+    });
+
+    it('an edit or a delete that names no version is refused', async () => {
+      const current = await read();
+      const edit = await bareCall(
+        'put',
+        `/ledger/manual-journals/${made.id}`,
+      ).send(body('99.00'));
+      expect(edit.status).toBe(400);
+      expect(errorType(edit)).toBe('VERSION_REQUIRED');
+
+      const gone = await bareCall(
+        'delete',
+        `/ledger/manual-journals/${made.id}`,
+      );
+      expect(gone.status).toBe(400);
+      expect(errorType(gone)).toBe('VERSION_REQUIRED');
+
+      expect(await read()).toEqual(current);
+      expect(await rent()).toBe('265.10');
+
+      // Not found is answered before the version is looked at.
+      const missingEdit = await bareCall(
+        'put',
+        '/ledger/manual-journals/99999999',
+      ).send(body('99.00'));
+      expect(missingEdit.status).toBe(404);
+      const missingDelete = await bareCall(
+        'delete',
+        '/ledger/manual-journals/99999999',
+      );
+      expect(missingDelete.status).toBe(404);
+      expect(errorType(missingDelete)).toBe('manual_journal_not_found');
+    });
+
+    it('a delete made from an old version is refused and the journal stays; from the current one it goes', async () => {
+      const current = await read();
+      const stale = await del(`/ledger/manual-journals/${made.id}?version=1`);
+      expect(stale.status).toBe(409);
+      expect(errorType(stale)).toBe('STALE_VERSION');
+      expect(error(stale).payload).toEqual({ current });
+
+      // Still there: read as it was, its two rows in the books, rent at 265.10.
+      expect(await read()).toEqual(current);
+      expect(await journalRows(made.id)).toHaveLength(2);
+      expect(await rent()).toBe('265.10');
+
+      await del(`/ledger/manual-journals/${made.id}?version=2`).expect(200);
+      expect((await get(`/ledger/manual-journals/${made.id}`)).status).toBe(
+        404,
+      );
+      expect(await rent()).toBe('250.10');
+    });
+  });
+
   describe('several journals at once', () => {
     const three = (bad: boolean) => ({
       journals: [
-        journal('2031-07-01T17:00:00Z', [
+        journal('2031-07-01', [
           line('6000', '1.00', '0'),
           line('1010', '0', '1.00'),
         ]),
-        journal('2031-07-02T17:00:00Z', [
+        journal('2031-07-02', [
           line('6100', '2.00', '0'),
           line('1010', '0', bad ? '2.50' : '2.00'),
         ]),
-        journal('2031-07-03T17:00:00Z', [
+        journal('2031-07-03', [
           line('6000', '3.00', '0'),
           line('1010', '0', '3.00'),
         ]),
@@ -985,7 +1238,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       const body = {
         journals: [1, 2, 3].map((n) =>
           journal(
-            `2031-07-0${n}T17:00:00Z`,
+            `2031-07-0${n}`,
             [line('6000', '1.00', '0'), line('1010', '0', '1.00')],
             { metadata: { blob: 'x'.repeat(60000) } },
           ),
@@ -1016,14 +1269,14 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       ).toHaveLength(0);
     });
 
-    it('creates all, and replaces one whose external id already exists', async () => {
+    it('creates all; a repeat with the same body answers the journal it has, and with another body refuses them all', async () => {
       const body = three(false);
       const first = await post('/ledger/manual-journals/bulk', body);
       expect(first.status).toBe(201);
-      expect(first.body.data.journals.map((j: any) => j.posted_at)).toEqual([
-        '2031-07-01T17:00:00.000Z',
-        '2031-07-02T17:00:00.000Z',
-        '2031-07-03T17:00:00.000Z',
+      expect(first.body.data.journals.map((j: any) => j.posted_on)).toEqual([
+        '2031-07-01',
+        '2031-07-02',
+        '2031-07-03',
       ]);
       const numbers = first.body.data.journals.map(
         (j: any) => j.journal_number,
@@ -1033,26 +1286,46 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect((await balances())['6000']).toBe('254.10');
       expect((await balances())['6100']).toBe('51.90');
 
-      const more = {
+      // The second of them with another body, beside a new journal: the
+      // whole request is refused, and the new journal is not made.
+      const fourth = journal('2031-07-04', [
+        line('6100', '4.00', '0'),
+        line('1010', '0', '4.00'),
+      ]);
+      const count = (await ws.rows('manual_journals')).length;
+      const changed = await post('/ledger/manual-journals/bulk', {
         journals: [
+          fourth,
           {
             ...body.journals[1],
             entries: [line('6000', '9.00', '0'), line('1010', '0', '9.00')],
           },
-          journal('2031-07-04T17:00:00Z', [
-            line('6100', '4.00', '0'),
-            line('1010', '0', '4.00'),
-          ]),
         ],
-      };
-      const second = await post('/ledger/manual-journals/bulk', more);
+      });
+      expect(changed.status).toBe(409);
+      expect(errorType(changed)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(changed).payload).toEqual({
+        kind: 'manual_journal',
+        externalId: body.journals[1].external_id,
+        recordId: first.body.data.journals[1].id,
+        state: 'live',
+        version: 1,
+      });
+      expect(await ws.rows('manual_journals')).toHaveLength(count);
+      expect(
+        await ws.rows('ext_external_ids', { externalId: fourth.external_id }),
+      ).toHaveLength(0);
+      // Neither the 9.00 on rent nor the 4.00 on supplies landed.
+      expect((await balances())['6000']).toBe('254.10');
+      expect((await balances())['6100']).toBe('51.90');
+
+      // The second of them as it was made, beside the new journal: it is
+      // answered as it is, and the new one is made.
+      const second = await post('/ledger/manual-journals/bulk', {
+        journals: [body.journals[1], fourth],
+      });
       expect(second.status).toBe(201);
-      expect(second.body.data.journals[0].id).toBe(
-        first.body.data.journals[1].id,
-      );
-      expect(second.body.data.journals[0].journal_number).toBe(
-        first.body.data.journals[1].journal_number,
-      );
+      expect(second.body.data.journals[0]).toEqual(first.body.data.journals[1]);
       expect(
         second.body.data.journals[0].entries.map((e: any) => [
           e.account.code,
@@ -1060,20 +1333,22 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
           e.credit,
         ]),
       ).toEqual([
-        ['6000', '9.00', '0.00'],
-        ['1010', '0.00', '9.00'],
+        ['6100', '2.00', '0.00'],
+        ['1010', '0.00', '2.00'],
       ]);
-      // Supplies: 49.90 + 4.00, the replaced 2.00 gone.
-      // Rent: 250.10 + 1.00 + 3.00 + 9.00.
-      expect((await balances())['6100']).toBe('53.90');
-      expect((await balances())['6000']).toBe('263.10');
+      expect(await ws.rows('manual_journals')).toHaveLength(count + 1);
+      // Supplies: 49.90 + 2.00 + 4.00, the 2.00 counted once.
+      // Rent: 250.10 + 1.00 + 3.00, as it was.
+      expect((await balances())['6100']).toBe('55.90');
+      expect((await balances())['6000']).toBe('254.10');
 
       // The same external id twice in one request is refused whole.
       const twice = await post('/ledger/manual-journals/bulk', {
-        journals: [more.journals[1], more.journals[1]],
+        journals: [fourth, fourth],
       });
       expect(twice.status).toBe(400);
-      expect((await balances())['6100']).toBe('53.90');
+      expect(errorType(twice)).toBe('EXTERNAL_ID_IN_USE');
+      expect((await balances())['6100']).toBe('55.90');
 
       for (const j of [
         ...first.body.data.journals,
@@ -1099,13 +1374,13 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         feed.body.data.map((e: any) => [
           e.source_type,
           e.source_id,
-          e.posted_at,
+          e.posted_on,
         ]),
       ).toEqual([
-        ['manual_journal', journals.J4.id, '2031-02-01T06:00:00.000Z'],
-        ['manual_journal', journals.J3.id, '2031-02-01T05:59:59.000Z'],
-        ['manual_journal', journals.J2.id, '2031-01-20T18:00:00.000Z'],
-        ['manual_journal', journals.J1.id, '2031-01-15T18:00:00.000Z'],
+        ['manual_journal', journals.J4.id, '2031-02-01'],
+        ['manual_journal', journals.J3.id, '2031-01-31'],
+        ['manual_journal', journals.J2.id, '2031-01-20'],
+        ['manual_journal', journals.J1.id, '2031-01-15'],
       ]);
       const j1 = feed.body.data[3];
       expect(j1.number).toBe('JE-000001');
@@ -1135,25 +1410,38 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       ]);
     });
 
-    it('takes a range: its start is in, its end is out', async () => {
+    it('takes a range of days that includes both of its ends', async () => {
       const ids = async (query: Record<string, unknown>) =>
         (
           await get('/ledger/entries', { order: 'asc', ...query }).expect(200)
         ).body.data.map((e: any) => e.source_id);
 
       expect(await ids({ from: FEB_START })).toEqual([journals.J4.id]);
-      expect(await ids({ to: FEB_START })).toEqual([
+      expect(await ids({ to: JAN_END })).toEqual([
         journals.J1.id,
         journals.J2.id,
         journals.J3.id,
       ]);
-      // From J2's instant to J3's: J2 is in, J3 is out.
-      expect(
-        await ids({ from: '2031-01-20T18:00:00Z', to: '2031-02-01T05:59:59Z' }),
-      ).toEqual([journals.J2.id]);
+      // J4 is dated 1 February, the last day of this range.
+      expect(await ids({ to: FEB_START })).toEqual([
+        journals.J1.id,
+        journals.J2.id,
+        journals.J3.id,
+        journals.J4.id,
+      ]);
+      // From J2's day to J3's: both are in.
+      expect(await ids({ from: '2031-01-20', to: JAN_END })).toEqual([
+        journals.J2.id,
+        journals.J3.id,
+      ]);
       expect(await ids({ from: FEB_START, to: JAN_START })).toEqual([]);
 
-      await get('/ledger/entries', { from: 'February' }).expect(400);
+      // A range is of plain dates: a word or a time of day is refused.
+      for (const from of ['February', '2031-02-01T06:00:00Z']) {
+        const res = await get('/ledger/entries', { from });
+        expect(res.status).toBe(400);
+        expect(errorType(res)).toBe('DATE_NOT_PLAIN');
+      }
     });
 
     it('gives a whole export in one page, each entry with its lines in order', async () => {
@@ -1222,7 +1510,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
           account: { id: id['6000'], code: '6000', name: 'Rent' },
           debit: '250.10',
           credit: '0.00',
-          posted_at: '2031-01-20T18:00:00.000Z',
+          posted_on: '2031-01-20',
           tracking: [
             { category: 'Location', option: 'North', option_name: 'North' },
           ],
@@ -1261,18 +1549,156 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         name: 'Rent',
         account_type: 'expense',
         parent_id: id['6000'],
+        is_type_root: false,
+        active: true,
         external_id: externalId,
         metadata: { someKey: 'v' },
         deletable: true,
         balance: '0.00',
         own_balance: '0.00',
+        version: 1,
       });
 
-      const repeat = await post('/ledger/accounts', { ...body, name: 'Other' });
+      // The same body again is a retry, answered with the account.
+      const repeat = await post('/ledger/accounts', body);
       expect(repeat.status).toBe(200);
-      expect(repeat.body.data).toEqual(first.body.data);
+      expect(repeat.body).toEqual({ data: first.body.data, replayed: true });
+
+      // Another body under its external id does not change it.
+      const renamed = await post('/ledger/accounts', {
+        ...body,
+        name: 'Other',
+      });
+      expect(renamed.status).toBe(409);
+      expect(errorType(renamed)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(renamed).payload).toEqual({
+        kind: 'account',
+        externalId,
+        recordId: first.body.data.id,
+        state: 'live',
+        version: 1,
+      });
+      expect(
+        (await get(`/ledger/accounts/${first.body.data.id}`)).body.data,
+      ).toEqual(first.body.data);
+      expect(
+        (await accounts()).filter((a) => a.external_id === externalId),
+      ).toHaveLength(1);
 
       await del(`/ledger/accounts/${first.body.data.id}`).expect(200);
+
+      // Deleted, its external id is spent: it makes no account again, with
+      // the body it was made with or with another.
+      for (const sent of [body, { ...body, name: 'Other' }]) {
+        const spent = await post('/ledger/accounts', sent);
+        expect(spent.status).toBe(409);
+        expect(errorType(spent)).toBe('EXTERNAL_ID_IN_USE');
+        expect(error(spent).payload).toEqual({
+          kind: 'account',
+          externalId,
+          recordId: first.body.data.id,
+          state: 'deleted',
+          version: null,
+        });
+      }
+      expect(
+        (await accounts()).filter((a) => a.external_id === externalId),
+      ).toHaveLength(0);
+    });
+
+    it('starts at version 1; a change made from its version lands and raises it, and one from an old version or none is refused', async () => {
+      const path = `/ledger/accounts`;
+      const created = (
+        await post(path, {
+          name: 'Versioned',
+          account_type: 'expense',
+          metadata: { someKey: 'v' },
+        })
+      ).body.data;
+      expect(created.version).toBe(1);
+      const read = async () => (await get(`${path}/${created.id}`)).body.data;
+      const stale = (res: request.Response, current: unknown) => {
+        expect(res.status).toBe(409);
+        expect(errorType(res)).toBe('STALE_VERSION');
+        expect(error(res).payload).toEqual({ current });
+      };
+      const required = (res: request.Response) => {
+        expect(res.status).toBe(400);
+        expect(errorType(res)).toBe('VERSION_REQUIRED');
+      };
+
+      // An edit: 1 to 2.
+      const edited = await put(`${path}/${created.id}`, {
+        name: 'Versioned Two',
+        version: 1,
+      });
+      expect(edited.status).toBe(200);
+      expect(edited.body.data).toEqual({
+        ...created,
+        name: 'Versioned Two',
+        version: 2,
+      });
+      let current = await read();
+      expect(current).toEqual(edited.body.data);
+
+      stale(
+        await put(`${path}/${created.id}`, { name: 'Late', version: 1 }),
+        current,
+      );
+      required(
+        await bareCall('put', `${path}/${created.id}`).send({ name: 'None' }),
+      );
+      expect(await read()).toEqual(current);
+
+      // Archived: 2 to 3. Restored: 3 to 4.
+      required(await bareCall('post', `${path}/${created.id}/archive`));
+      stale(
+        await post(`${path}/${created.id}/archive`, { version: 1 }),
+        current,
+      );
+      expect((await read()).active).toBe(true);
+      const archived = await post(`${path}/${created.id}/archive`, {
+        version: 2,
+      });
+      expect(archived.status).toBe(200);
+      expect([archived.body.data.active, archived.body.data.version]).toEqual([
+        false,
+        3,
+      ]);
+      current = await read();
+      stale(
+        await post(`${path}/${created.id}/restore`, { version: 2 }),
+        current,
+      );
+      expect((await read()).active).toBe(false);
+      const restored = await post(`${path}/${created.id}/restore`, {
+        version: 3,
+      });
+      expect([restored.body.data.active, restored.body.data.version]).toEqual([
+        true,
+        4,
+      ]);
+
+      // A delete from an old version, or from none, leaves it there.
+      current = await read();
+      stale(await del(`${path}/${created.id}?version=3`), current);
+      required(await bareCall('delete', `${path}/${created.id}`));
+      expect(await read()).toEqual(current);
+      expect(current).toEqual({
+        ...created,
+        name: 'Versioned Two',
+        version: 4,
+      });
+
+      // Not found is answered before the version is looked at.
+      const missing = await bareCall('put', `${path}/99999999`).send({
+        name: 'Nobody',
+      });
+      expect(missing.status).toBe(404);
+      expect(errorType(missing)).toBe('account_not_found');
+
+      await del(`${path}/${created.id}?version=4`).expect(200);
+      expect((await get(`${path}/${created.id}`)).status).toBe(404);
     });
 
     it('refuses a parent of another root type, a second receivable account and an unknown type', async () => {
@@ -1339,6 +1765,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         name: 'Temporary',
         code: '6901',
         parent_id: id['6100'],
+        version: 2,
       });
 
       const cleared = await put(`/ledger/accounts/${created.id}`, {
@@ -1349,6 +1776,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         name: 'Temporary',
         code: null,
         parent_id: null,
+        version: 3,
       });
       await del(`/ledger/accounts/${created.id}`).expect(200);
     });
@@ -1422,7 +1850,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         })
       ).body.data;
       const posted = await post('/ledger/manual-journals', {
-        posted_at: '2031-06-05T17:00:00Z',
+        posted_on: '2031-06-05',
         entries: [
           { account_id: parent.id, debit: '1.00', credit: '0' },
           line('1010', '0', '1.00'),
@@ -1478,30 +1906,27 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
 
     beforeAll(async () => {
       open = (
-        await post(
-          '/ledger/manual-journals',
-          journal('2031-02-10T18:00:00Z', entries()),
-        )
+        await post('/ledger/manual-journals', journal('2031-02-10', entries()))
       ).body.data;
 
       const res = await put('/ledger/settings', {
-        closing_at: '2031-02-01T00:00:00-06:00',
+        locked_through: JAN_END,
       });
       expect(res.status).toBe(200);
       expect(res.body.data).toEqual({
-        closing_at: FEB_START,
+        locked_through: JAN_END,
         reporting_basis: 'accrual',
       });
     });
 
     afterAll(async () => {
-      await put('/ledger/settings', { closing_at: null }).expect(200);
+      await put('/ledger/settings', { locked_through: null }).expect(200);
       await del(`/ledger/manual-journals/${open.id}`).expect(200);
     });
 
-    it('is read back exactly, and sets the day lock on the day before', async () => {
+    it("is read back as it was set, and sets Bigcapital's own lock to the same day", async () => {
       const read = await get('/ledger/settings').expect(200);
-      expect(read.body.data.closing_at).toBe(FEB_START);
+      expect(read.body.data.locked_through).toBe(JAN_END);
 
       const bigcapital = await http()
         .get('/transactions-locking')
@@ -1510,25 +1935,29 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       expect(JSON.stringify(bigcapital.body)).toContain('2031-01-31');
     });
 
-    it('refuses a create a millisecond before the closing instant, and allows one at it', async () => {
-      locked(
-        await post(
-          '/ledger/manual-journals',
-          journal('2031-02-01T05:59:59.999Z', entries()),
-        ),
+    it('is inclusive: refuses a create on the last locked day, and allows one the day after', async () => {
+      const last = await post(
+        '/ledger/manual-journals',
+        journal(JAN_END, entries()),
       );
-      const at = await post(
+      locked(last);
+      expect(last.body.errors[0].payload).toEqual({
+        lockedThrough: JAN_END,
+        date: JAN_END,
+      });
+
+      const after = await post(
         '/ledger/manual-journals',
         journal(FEB_START, entries()),
       );
-      expect(at.status).toBe(201);
-      await del(`/ledger/manual-journals/${at.body.data.id}`).expect(200);
+      expect(after.status).toBe(201);
+      await del(`/ledger/manual-journals/${after.body.data.id}`).expect(200);
     });
 
     it('refuses an edit and a delete of a locked journal, and leaves it as it was', async () => {
       locked(
         await put(`/ledger/manual-journals/${journals.J2.id}`, {
-          posted_at: journals.J2.posted_at,
+          posted_on: journals.J2.posted_on,
           entries: entries(),
         }),
       );
@@ -1543,27 +1972,65 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     it('refuses moving an open journal into the locked period, and a locked one out of it', async () => {
       locked(
         await put(`/ledger/manual-journals/${open.id}`, {
-          posted_at: '2031-01-10T18:00:00Z',
+          posted_on: '2031-01-10',
           entries: entries(),
         }),
       );
       locked(
         await put(`/ledger/manual-journals/${journals.J2.id}`, {
-          posted_at: '2031-03-10T18:00:00Z',
+          posted_on: '2031-03-10',
           entries: entries(),
         }),
       );
     });
 
-    it('refuses a create that would replace a locked journal, alone or in bulk', async () => {
-      const body = journal('2031-02-12T18:00:00Z', entries(), {
+    it('a create under the external id of a locked journal is refused as any repeat with another body is, alone or in bulk; a retry of its own create is still answered', async () => {
+      const count = (await ws.rows('manual_journals')).length;
+      const body = journal('2031-02-12', entries(), {
         external_id: journals.J1.external_id,
       });
-      locked(await post('/ledger/manual-journals', body));
-      locked(await post('/ledger/manual-journals/bulk', { journals: [body] }));
+      const refusals = [
+        await post('/ledger/manual-journals', body),
+        await post('/ledger/manual-journals/bulk', { journals: [body] }),
+      ];
+      for (const res of refusals) {
+        expect(res.status).toBe(409);
+        expect(errorType(res)).toBe('EXTERNAL_ID_IN_USE');
+        // J1 has not been changed since it was made.
+        expect(error(res).payload).toEqual({
+          kind: 'manual_journal',
+          externalId: journals.J1.external_id,
+          recordId: journals.J1.id,
+          state: 'live',
+          version: 1,
+        });
+      }
+      // J1 sent again as it was made: its day is closed now, and the retry
+      // is answered all the same, with nothing written.
+      const retry = await post('/ledger/manual-journals', bodies.J1);
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: journals.J1, replayed: true });
+      // The same retry in bulk, beside a new journal on an open day: J1 is
+      // answered as it stands, in its place, and the new one is made.
+      const bulk = await post('/ledger/manual-journals/bulk', {
+        journals: [bodies.J1, journal('2031-02-13', entries())],
+      });
+      expect(bulk.status).toBe(201);
+      expect(bulk.body.data.journals[0]).toEqual(journals.J1);
+      expect(bulk.body.data.journals[1].posted_on).toBe('2031-02-13');
+      await del(
+        `/ledger/manual-journals/${bulk.body.data.journals[1].id}`,
+      ).expect(200);
+      // And alone in a bulk request, with nothing new beside it.
+      const alone = await post('/ledger/manual-journals/bulk', {
+        journals: [bodies.J1],
+      });
+      expect(alone.status).toBe(201);
+      expect(alone.body.data.journals).toEqual([journals.J1]);
 
       const read = await get(`/ledger/manual-journals/${journals.J1.id}`);
       expect(read.body.data).toEqual(journals.J1);
+      expect(await ws.rows('manual_journals')).toHaveLength(count);
     });
 
     it('refuses a bulk create with any journal in the locked period', async () => {
@@ -1571,49 +2038,50 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       locked(
         await post('/ledger/manual-journals/bulk', {
           journals: [
-            journal('2031-03-01T18:00:00Z', entries()),
-            journal('2031-01-05T18:00:00Z', entries()),
+            journal('2031-03-01', entries()),
+            journal('2031-01-05', entries()),
           ],
         }),
       );
       expect(await ws.rows('manual_journals')).toHaveLength(before);
     });
 
-    it('a closing instant in the middle of a day locks that morning only', async () => {
-      await put('/ledger/settings', {
-        closing_at: '2031-03-15T18:00:00Z',
-      }).expect(200);
+    it('takes a plain date only: a lock or a journal dated with a time is refused', async () => {
+      for (const value of [
+        '2031-03-15T12:00:00Z',
+        '2031-03-15T00:00:00.000Z',
+      ]) {
+        const lock = await put('/ledger/settings', { locked_through: value });
+        expect(lock.status).toBe(400);
+        expect(errorType(lock)).toBe('DATE_NOT_PLAIN');
 
-      locked(
-        await post(
+        const dated = await post(
           '/ledger/manual-journals',
-          journal('2031-03-15T17:59:59Z', entries()),
-        ),
+          journal(value, entries()),
+        );
+        expect(dated.status).toBe(400);
+        expect(errorType(dated)).toBe('DATE_NOT_PLAIN');
+      }
+      // The lock is as it was.
+      expect((await get('/ledger/settings')).body.data.locked_through).toBe(
+        JAN_END,
       );
-      const afternoon = await post(
-        '/ledger/manual-journals',
-        journal('2031-03-15T18:00:00Z', entries()),
-      );
-      expect(afternoon.status).toBe(201);
-      await del(`/ledger/manual-journals/${afternoon.body.data.id}`).expect(
-        200,
-      );
-
-      await put('/ledger/settings', { closing_at: FEB_START }).expect(200);
     });
 
     it('clearing it reopens the books', async () => {
-      await put('/ledger/settings', { closing_at: null }).expect(200);
-      expect((await get('/ledger/settings')).body.data.closing_at).toBeNull();
+      await put('/ledger/settings', { locked_through: null }).expect(200);
+      expect(
+        (await get('/ledger/settings')).body.data.locked_through,
+      ).toBeNull();
 
       const res = await post(
         '/ledger/manual-journals',
-        journal('2031-01-05T18:00:00Z', entries()),
+        journal('2031-01-05', entries()),
       );
       expect(res.status).toBe(201);
       await del(`/ledger/manual-journals/${res.body.data.id}`).expect(200);
 
-      await put('/ledger/settings', { closing_at: FEB_START }).expect(200);
+      await put('/ledger/settings', { locked_through: JAN_END }).expect(200);
     });
 
     it('sets the reporting basis, which the workspace then reports', async () => {
@@ -1621,7 +2089,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         reporting_basis: 'cash',
       }).expect(200);
       expect(res.body.data).toEqual({
-        closing_at: FEB_START,
+        locked_through: JAN_END,
         reporting_basis: 'cash',
       });
 
@@ -1653,7 +2121,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
         'put',
         `/ledger/manual-journals/${journals.J4.id}`,
       ).send({
-        posted_at: '2031-02-01T06:00:00Z',
+        posted_on: '2031-02-01',
         entries: [line('1200', '1.00', '0'), line('4000', '0', '1.00')],
       });
       expect(edit.status).toBe(404);
@@ -1695,11 +2163,11 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
   });
 
   describe("the books' start", () => {
-    const setStart = (booksStartAt: string) =>
+    const setStart = (booksStartOn: string) =>
       http()
         .put(`/ledger/workspaces/${ws.workspace.id}`)
         .set(ws.user.headers())
-        .send({ books_start_at: booksStartAt })
+        .send({ books_start_on: booksStartOn })
         .expect(200);
     const feedTotal = async (query = {}) =>
       (await get('/ledger/entries', query).expect(200)).body.pagination.total;
@@ -1707,7 +2175,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
       (await get(`/ledger/accounts/${id['1010']}/lines`, query).expect(200))
         .body.pagination.total;
 
-    afterAll(() => setStart('2030-01-01T06:00:00Z'));
+    afterAll(() => setStart('2030-01-01'));
 
     it('entries before it are left out of balances, the feed and account lines', async () => {
       // Starting 1 February, only J4 counts.
@@ -1764,7 +2232,7 @@ describe('Ledger extension: accounts, manual journals, balances and the lock', (
     });
 
     it('the feed takes its one sort key, and refuses another', async () => {
-      await get('/ledger/entries', { sort: 'posted_at', order: 'desc' }).expect(
+      await get('/ledger/entries', { sort: 'posted_on', order: 'desc' }).expect(
         200,
       );
       await get('/ledger/entries', { sort: 'amount' }).expect(400);

@@ -1,4 +1,9 @@
 import { randomBytes } from 'crypto';
+import {
+  raiseVersion,
+  refusingStale,
+  requireVersion,
+} from '../common/versions';
 import { Knex } from 'knex';
 import { HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { ClsService } from 'nestjs-cls';
@@ -40,6 +45,8 @@ export interface PartyView {
   addressString: string | null;
   notes: string | null;
   active: boolean;
+  /** Raised by every change to the party's fields. */
+  version: number;
 }
 
 const FIELDS: Array<keyof PartyFields> = [
@@ -72,27 +79,62 @@ export class ExtPartiesService {
   ) {}
 
   /**
-   * Creates a party, or replaces the fields of the one already carrying the
-   * external id.
+   * Creates a party. A create carrying the external id of an existing party
+   * is a retry when its fields are the ones the party was made with, and is
+   * answered with the party; otherwise it is refused, and the party is
+   * changed through `update`.
+   * @throws {ServiceError} EXTERNAL_ID_IN_USE
    */
-  public async upsert(
+  public async create(
     kind: PartyKind,
     fields: PartyFields & { externalId?: string | null },
-  ): Promise<{ party: PartyView; created: boolean }> {
-    const { recordId, created } = await this.externalIds.createOnce({
+  ): Promise<{ party: PartyView; created: boolean; replayed: boolean }> {
+    const { recordId, created, replayed } = await this.externalIds.createOnce({
       kind,
       externalId: fields.externalId,
+      body: fields,
+      describe: async (id) => ({
+        state: 'live' as const,
+        version: (await this.get(kind, id)).version,
+      }),
       create: (trx) => this.createInTransaction(kind, fields, trx),
       read: async (id) => id,
     });
-    if (!created) {
-      await this.uow.withTransaction((trx) =>
-        trx(TABLE)
-          .where({ contactId: recordId, kind })
-          .update({ ...this.columns(fields), updatedAt: trx.fn.now() }),
-      );
-    }
-    return { party: await this.get(kind, recordId), created };
+    return { party: await this.get(kind, recordId), created, replayed };
+  }
+
+  /**
+   * Replaces the fields of a party with the ones given.
+   * @throws {ServiceError} VERSION_REQUIRED, STALE_VERSION
+   */
+  public async update(
+    kind: PartyKind,
+    partyId: number,
+    fields: PartyFields & { version?: number | null },
+  ): Promise<PartyView> {
+    await this.get(kind, partyId);
+    const version = requireVersion(fields.version);
+
+    await refusingStale(
+      () =>
+        this.uow.withTransaction(async (trx) => {
+          await raiseVersion(trx, TABLE, { contactId: partyId, kind }, version);
+          await trx(TABLE)
+            .where({ contactId: partyId, kind })
+            .update({ ...this.columns(fields), updatedAt: trx.fn.now() });
+          // The same fields sent again under the party's external id are a
+          // retry of what it now holds, not a change.
+          const { version: _version, ...held } = fields;
+          await this.externalIds.rehash(
+            kind,
+            partyId,
+            (externalId) => ({ ...held, externalId }),
+            trx,
+          );
+        }),
+      () => this.get(kind, partyId),
+    );
+    return this.get(kind, partyId);
   }
 
   /**
@@ -108,6 +150,8 @@ export class ExtPartiesService {
       const { recordId } = await this.externalIds.createOnce({
         kind,
         externalId,
+        // Made from its id alone: whichever party holds the id is the one meant.
+        anyBody: true,
         create: (innerTrx) => this.createInTransaction(kind, {}, innerTrx),
         read: async (id) => id,
         trx,
@@ -241,9 +285,22 @@ export class ExtPartiesService {
         addressString: row.addressString ?? null,
         notes: row.notes ?? null,
         active: true,
+        version: Number(row.version),
       });
     });
     return views;
+  }
+
+  /** Whether each contact given is a vendor or a customer; others are left out. */
+  public async kindsOf(contactIds: number[]): Promise<Map<number, PartyKind>> {
+    const kinds = new Map<number, PartyKind>();
+    if (contactIds.length === 0) return kinds;
+
+    const rows = await this.tenantKnex()(TABLE)
+      .whereIn('contactId', contactIds)
+      .select('contactId', 'kind');
+    rows.forEach((row: any) => kinds.set(Number(row.contactId), row.kind));
+    return kinds;
   }
 
   private async createInTransaction(

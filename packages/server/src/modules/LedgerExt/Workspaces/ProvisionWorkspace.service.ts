@@ -183,6 +183,7 @@ export class ProvisionWorkspaceService {
             : null,
           name: entry.name,
           code: entry.code,
+          isTypeRoot: Boolean(entry.typeRoot),
         },
         trx,
       );

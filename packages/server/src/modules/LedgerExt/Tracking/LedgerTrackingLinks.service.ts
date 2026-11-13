@@ -1,7 +1,10 @@
 import { Knex } from 'knex';
 import { HttpStatus, Injectable } from '@nestjs/common';
 import { ServiceError } from '@/modules/Items/ServiceError';
+import { ExtAuditService } from '../common/ExtAudit.service';
 import { ExtUnitOfWork } from '../common/ExtUnitOfWork.service';
+import { ExtLockService } from '../Lock/ExtLock.service';
+import { ExtRecordKind } from '../LedgerExt.constants';
 import { inChunks } from '../common/chunks';
 import { TradeLedgerService } from '../Trade/TradeLedger.service';
 import { TradeConfig } from '../Trade/trade.config';
@@ -23,8 +26,11 @@ const JOURNAL_REFERENCE = 'Journal';
  * Links between document lines and tracking options, made and removed on
  * their own, without the document being sent again.
  *
- * A link moves no money, so it is allowed on a document in a locked period.
- * It leaves the line's id as it was. The document's ledger rows are brought
+ * A link moves no money, but it changes what a period's reports say by
+ * tag, so it is refused on a document dated in a locked period, as an edit
+ * of the document is. Each line changed is written to the audit log with
+ * the assignments it had and the ones it has. A link leaves the line's id
+ * as it was. The document's ledger rows are brought
  * in step in the same transaction: a journal's rows take the assignment in
  * place; a bill's or an invoice's are written again, as an edit writes them.
  */
@@ -34,6 +40,8 @@ export class LedgerTrackingLinksService {
     private readonly uow: ExtUnitOfWork,
     private readonly tracking: ExtTrackingService,
     private readonly tradeLedger: TradeLedgerService,
+    private readonly lock: ExtLockService,
+    private readonly audit: ExtAuditService,
   ) {}
 
   /**
@@ -47,7 +55,7 @@ export class LedgerTrackingLinksService {
   ): Promise<TrackingLinkView[]> {
     const { kind, config } = LINE_TYPES[dto.lineType];
     const lineIds = [...new Set(dto.lineIds)];
-    // Categories and options are made before the transaction opens.
+    // The categories and options named must exist already, and be active.
     const resolved = await this.tracking.resolve(dto.tracking);
     const wanted = new Map<number, number>();
 
@@ -56,7 +64,8 @@ export class LedgerTrackingLinksService {
       wanted.set(categoryId, optionId);
     });
 
-    return this.uow.withTransaction(async (trx) => {
+    const logged: Array<[number, number]> = [];
+    const links = await this.uow.withTransaction(async (trx) => {
       const lines = await inChunks(lineIds, (run) =>
         trx('ext_lines').where({ kind }).whereIn('id', run),
       );
@@ -74,10 +83,23 @@ export class LedgerTrackingLinksService {
         );
       }
       await this.lockDocuments(config, lines, trx);
+      await this.assertOpen(config, lines, trx);
 
       const current = await this.tracking.ofLines(lineIds, trx);
 
       for (const lineId of lineIds) {
+        logged.push([
+          lineId,
+          await this.audit.record(
+            {
+              action: 'edit',
+              subject: kind,
+              subjectId: lineId,
+              before: { tracking: this.assignments(current.get(lineId)) },
+            },
+            trx,
+          ),
+        ]);
         const kept = (current.get(lineId) ?? []).filter(
           (link) => !wanted.has(link.categoryId),
         );
@@ -97,18 +119,64 @@ export class LedgerTrackingLinksService {
 
       const after = await this.tracking.ofLines(lineIds, trx);
 
-      return lineIds.flatMap((lineId) =>
-        (after.get(lineId) ?? [])
-          .filter((link) => wanted.has(link.categoryId))
-          .map((link) => ({
-            id: link.id,
-            lineId,
-            category: link.category,
-            option: link.option,
-            optionName: link.optionName,
-          })),
-      );
+      return {
+        after,
+        views: lineIds.flatMap((lineId) =>
+          (after.get(lineId) ?? [])
+            .filter((link) => wanted.has(link.categoryId))
+            .map((link) => ({
+              id: link.id,
+              lineId,
+              category: link.category,
+              option: link.option,
+              optionName: link.optionName,
+            })),
+        ),
+      };
     });
+    for (const [lineId, auditId] of logged) {
+      await this.audit.finish(auditId, {
+        tracking: this.assignments(links.after.get(lineId)),
+      });
+    }
+    return links.views;
+  }
+
+  /** A line's assignments as the audit log keeps them. */
+  private assignments(
+    links: Array<{ category: string; option: string }> | undefined,
+  ): Array<{ category: string; option: string }> {
+    return (links ?? []).map(({ category, option }) => ({ category, option }));
+  }
+
+  /**
+   * Refuses when a line's document is dated in a locked period. Each
+   * document's own day is the one looked at.
+   */
+  private async assertOpen(
+    config: TradeConfig | null,
+    lines: any[],
+    trx: Knex.Transaction,
+  ): Promise<void> {
+    const recordIds = [...new Set(lines.map((line) => Number(line.recordId)))];
+    if (recordIds.length === 0) return;
+
+    const rows = config
+      ? await inChunks(recordIds, (run) =>
+          trx('ext_trade_documents')
+            .whereIn('id', run)
+            .select('posted_on as on'),
+        )
+      : await inChunks(recordIds, (run) =>
+          trx('ext_documents')
+            .where({ kind: ExtRecordKind.ManualJournal })
+            .whereIn('record_id', run)
+            .select('transacted_on as on'),
+        );
+    await this.lock.assertOpen(
+      rows.map((row: any) => row.on),
+      trx,
+    );
   }
 
   /**
@@ -116,6 +184,7 @@ export class LedgerTrackingLinksService {
    */
   public async remove(ids: number[]): Promise<void> {
     const linkIds = [...new Set(ids)];
+    const logged: Array<[number, unknown]> = [];
 
     await this.uow.withTransaction(async (trx) => {
       const links = await inChunks(linkIds, (run) =>
@@ -148,6 +217,32 @@ export class LedgerTrackingLinksService {
         if (ofKind.length === 0) continue;
 
         await this.lockDocuments(config, ofKind, trx);
+        await this.assertOpen(config, ofKind, trx);
+
+        const ofLines = [
+          ...new Set(ofKind.map((link: any) => Number(link.id))),
+        ];
+        const before = await this.tracking.ofLines(ofLines, trx);
+        const removed = new Set(ofKind.map((link: any) => Number(link.linkId)));
+        for (const lineId of ofLines) {
+          const had = before.get(lineId) ?? [];
+          logged.push([
+            await this.audit.record(
+              {
+                action: 'edit',
+                subject: kind,
+                subjectId: lineId,
+                before: { tracking: this.assignments(had) },
+              },
+              trx,
+            ),
+            {
+              tracking: this.assignments(
+                had.filter((link) => !removed.has(link.id)),
+              ),
+            },
+          ]);
+        }
         await inChunks(
           ofKind.map((link: any) => Number(link.linkId)),
           (run) =>
@@ -176,6 +271,9 @@ export class LedgerTrackingLinksService {
         }
       }
     });
+    for (const [auditId, after] of logged) {
+      await this.audit.finish(auditId, after);
+    }
   }
 
   /**

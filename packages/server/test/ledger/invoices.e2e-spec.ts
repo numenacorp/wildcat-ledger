@@ -2,7 +2,9 @@ import request = require('supertest');
 import { randomUUID } from 'crypto';
 import { INestApplication } from '@nestjs/common';
 import {
+  change,
   createTestApp,
+  createTestTags,
   createTestWorkspace,
   dropOrganizations,
   TestWorkspace,
@@ -23,12 +25,14 @@ import {
  * paid, not on the invoice's day:
  *   March   1200 +900   4000 -600   4100 -300
  *   April   1010 +300   1200 -300
- *   June    1300 (clearing) +600.25   1200 -600   4900 (uncategorized) -0.25
+ *   June    1300 (clearing) +600.25   1200 -600.25   (the 0.25 beyond I1
+ *           is a credit with the customer, on receivables)
  *
  * Cash. Nothing until money moves; then the invoice's lines in proportion:
  *   April   Q1 is a third: 1010 +300   4000 -200   4100 -100
  *   June    Q2 is two thirds: 1300 +600  4000 -400  4100 -200
- *           and the 0.25:  1300 +0.25   4900 -0.25
+ *           and the 0.25:  1300 +0.25   4900 -0.25   (unapplied cash: this
+ *           chart marks no account for it, so the uncategorized one stands in)
  */
 const chart = () => [
   { code: '1010', name: 'Operating', account_type: 'bank' },
@@ -61,9 +65,9 @@ const chart = () => [
   },
 ];
 
-const MAR = { from: '2031-03-01T06:00:00Z', to: '2031-04-01T05:00:00Z' };
-const APR = { from: '2031-04-01T05:00:00Z', to: '2031-05-01T05:00:00Z' };
-const JUN = { from: '2031-06-01T05:00:00Z', to: '2031-07-01T05:00:00Z' };
+const MAR = { from: '2031-03-01', to: '2031-03-31' };
+const APR = { from: '2031-04-01', to: '2031-04-30' };
+const JUN = { from: '2031-06-01', to: '2031-06-30' };
 
 describe('Ledger extension: customers, invoices and invoice payments', () => {
   let app: INestApplication;
@@ -80,16 +84,11 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
   const get = (path: string, query: Record<string, unknown> = {}) =>
     http().get(path).query(query).set(ws.headers());
   const post = (path: string, body: unknown = {}) =>
-    http()
-      .post(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'post', path, ws.headers(), body);
   const put = (path: string, body: unknown) =>
-    http()
-      .put(path)
-      .set(ws.headers())
-      .send(body as any);
-  const del = (path: string) => http().delete(path).set(ws.headers());
+    change(app, 'put', path, ws.headers(), body);
+  const del = (path: string) => change(app, 'delete', path, ws.headers());
+  const error = (res: request.Response) => res.body?.errors?.[0];
   const errorType = (res: request.Response) => res.body?.errors?.[0]?.type;
 
   const entry = (code: string, rate: string, extra = {}) => ({
@@ -97,22 +96,22 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     rate,
     ...extra,
   });
-  const invoice = (postedAt: string, entries: unknown[], extra = {}) => ({
+  const invoice = (postedOn: string, entries: unknown[], extra = {}) => ({
     external_id: `i:${randomUUID()}`,
     customer_id: customer.id,
-    posted_at: postedAt,
+    posted_on: postedOn,
     entries,
     ...extra,
   });
   const payment = (
-    paidAt: string,
+    paidOn: string,
     amount: string,
     allocations: Array<[number, string]>,
     extra = {},
   ) => ({
     external_id: `q:${randomUUID()}`,
     customer_id: customer.id,
-    paid_at: paidAt,
+    paid_on: paidOn,
     amount,
     allocations: allocations.map(([invoiceId, a]) => ({
       invoice_id: invoiceId,
@@ -151,6 +150,9 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       })
     ).body.data;
     other = (await post('/ledger/customers', { external_id: 'c-2' })).body.data;
+    // A line names tags that exist: the ones the invoices below carry are made
+    // first.
+    await createTestTags(app, ws.headers(), 'Location', ['North', 'South']);
   });
 
   afterAll(async () => {
@@ -159,7 +161,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
   });
 
   describe('a customer', () => {
-    it('is created, replaced whole by a repeat, read and listed', async () => {
+    it('is created once, has its fields replaced by an update, and is read and listed', async () => {
       expect(customer).toEqual({
         id: expect.any(Number),
         external_id: 'c-1',
@@ -171,19 +173,63 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         address_string: null,
         notes: null,
         active: true,
+        version: 1,
       });
+      // The create it was made with, sent again, is a retry.
+      const retry = await post('/ledger/customers', {
+        external_id: 'c-1',
+        company_name: 'Buyer Co',
+      });
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: customer, replayed: true });
+
+      // Other fields under its external id do not replace it.
       const again = await post('/ledger/customers', {
         external_id: 'c-1',
         company_name: 'Buyer Company',
         email: 'ar@buyer.test',
       });
-      expect(again.status).toBe(200);
-      expect(again.body.data).toEqual({
+      expect(again.status).toBe(409);
+      expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(again).payload).toEqual({
+        kind: 'customer',
+        externalId: 'c-1',
+        recordId: customer.id,
+        state: 'live',
+        version: 1,
+      });
+      expect((await get(`/ledger/customers/${customer.id}`)).body.data).toEqual(
+        customer,
+      );
+
+      // The update does, from the version it was read at: 1, and 2 after.
+      const stale = await put(`/ledger/customers/${customer.id}`, {
+        company_name: 'Buyer Company',
+        version: 2,
+      });
+      expect(stale.status).toBe(409);
+      expect(errorType(stale)).toBe('STALE_VERSION');
+      expect(error(stale).payload).toEqual({ current: customer });
+      const none = await http()
+        .put(`/ledger/customers/${customer.id}`)
+        .set(ws.headers())
+        .send({ company_name: 'Buyer Company' });
+      expect(none.status).toBe(400);
+      expect(errorType(none)).toBe('VERSION_REQUIRED');
+
+      const updated = await put(`/ledger/customers/${customer.id}`, {
+        company_name: 'Buyer Company',
+        email: 'ar@buyer.test',
+        version: 1,
+      });
+      expect(updated.status).toBe(200);
+      expect(updated.body.data).toEqual({
         ...customer,
         company_name: 'Buyer Company',
         email: 'ar@buyer.test',
+        version: 2,
       });
-      customer = again.body.data;
+      customer = updated.body.data;
 
       expect((await get(`/ledger/customers/${customer.id}`)).body.data).toEqual(
         customer,
@@ -210,7 +256,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       const res = await post(
         '/ledger/invoices',
         invoice(
-          '2031-03-12T18:00:00Z',
+          '2031-03-12',
           [
             entry('4000', '600.00', {
               external_id: 'i1-sales',
@@ -223,7 +269,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
             invoice_number: 'A-17',
             reference: 'PO-9',
             note: 'First invoice',
-            due_at: '2031-04-11T18:00:00Z',
+            due_on: '2031-04-11',
             metadata: { sourceDoc: 'x' },
           },
         ),
@@ -236,9 +282,9 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       expect(i1).toMatchObject({
         id: expect.any(Number),
         status: 'open',
-        posted_at: '2031-03-12T18:00:00.000Z',
-        due_at: '2031-04-11T18:00:00.000Z',
-        paid_at: null,
+        posted_on: '2031-03-12',
+        due_on: '2031-04-11',
+        paid_on: null,
         voided_at: null,
         invoice_number: 'A-17',
         reference: 'PO-9',
@@ -278,14 +324,14 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     });
 
     it('is issued a number when it is sent none, and keeps its number through an edit', async () => {
-      const body = invoice('2031-03-13T18:00:00Z', [entry('4100', '1.00')]);
+      const body = invoice('2031-03-13', [entry('4100', '1.00')]);
       const made = await post('/ledger/invoices', body);
 
       expect(made.body.data.invoice_number).toMatch(/^INV-\d{6}$/);
 
       const edited = await put(`/ledger/invoices/${made.body.data.id}`, {
         customer_id: customer.id,
-        posted_at: '2031-03-13T18:00:00Z',
+        posted_on: '2031-03-13',
         entries: [entry('4100', '2.00')],
       });
       expect(edited.status).toBe(200);
@@ -296,7 +342,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     });
 
     it('needs a customer that exists: one not seen before is not made', async () => {
-      const { customer_id: _c, ...body } = invoice('2031-03-13T18:00:00Z', [
+      const { customer_id: _c, ...body } = invoice('2031-03-13', [
         entry('4100', '1.00'),
       ]);
       const before = (await get('/ledger/customers')).body.pagination.total;
@@ -320,7 +366,9 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         200,
       );
 
-      expect(errorType(await post('/ledger/invoices', body))).toBe(
+      // Under an id of its own: the id above now names a voided invoice.
+      const { external_id: _e, ...unnamed } = body;
+      expect(errorType(await post('/ledger/invoices', unnamed))).toBe(
         'CUSTOMER_REQUIRED',
       );
     });
@@ -330,7 +378,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     beforeAll(async () => {
       const first = await post(
         '/ledger/invoice-payments',
-        payment('2031-04-08T18:00:00Z', '300.00', [[i1.id, '300.00']], {
+        payment('2031-04-08', '300.00', [[i1.id, '300.00']], {
           account_id: id['1010'],
           method: 'ACH',
           reference: 'DEP-1',
@@ -341,7 +389,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
       const second = await post(
         '/ledger/invoice-payments',
-        payment('2031-06-02T18:00:00Z', '600.25', [[i1.id, '600.00']]),
+        payment('2031-06-02', '600.25', [[i1.id, '600.00']]),
       );
       expect(second.status).toBe(201);
       q2 = second.body.data;
@@ -351,10 +399,13 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       expect(q1).toEqual({
         id: expect.any(Number),
         external_id: expect.stringMatching(/^q:/),
-        paid_at: '2031-04-08T18:00:00.000Z',
+        version: 1,
+        paid_on: '2031-04-08',
         method: 'ACH',
         processor: null,
         amount: '300.00',
+        unapplied: '0.00',
+        applications: [],
         customer_id: customer.id,
         customer,
         account_id: id['1010'],
@@ -387,14 +438,17 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         ['2031-04-08', 'cash', '4100', '-100.00'],
       ]);
       expect(await rowsOf('PaymentReceive', q2.id)).toEqual([
+        ['2031-06-02', 'accrual', '1200', '-0.25'],
         ['2031-06-02', 'accrual', '1200', '-600.00'],
+        ['2031-06-02', 'accrual', '1300', '0.25'],
         ['2031-06-02', 'accrual', '1300', '600.00'],
-        ['2031-06-02', 'both', '1300', '0.25'],
-        ['2031-06-02', 'both', '4900', '-0.25'],
+        ['2031-06-02', 'cash', '1300', '0.25'],
         ['2031-06-02', 'cash', '1300', '600.00'],
         ['2031-06-02', 'cash', '4000', '-400.00'],
         ['2031-06-02', 'cash', '4100', '-200.00'],
+        ['2031-06-02', 'cash', '4900', '-0.25'],
       ]);
+      expect(q2.unapplied).toBe('0.25');
     });
 
     it('give the hand-worked books on both bases, month by month', async () => {
@@ -408,9 +462,8 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         '1200': '-300.00',
       });
       expect(await balances({ basis: 'accrual', ...JUN })).toEqual({
-        '1200': '-600.00',
+        '1200': '-600.25',
         '1300': '600.25',
-        '4900': '-0.25',
       });
       expect(await balances({ basis: 'cash', ...MAR })).toEqual({});
       expect(await balances({ basis: 'cash', ...APR })).toEqual({
@@ -424,25 +477,40 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         '4100': '-200.00',
         '4900': '-0.25',
       });
-      // Paid in full, both bases agree to date.
-      expect(await balances({ basis: 'cash' })).toEqual(
-        await balances({ basis: 'accrual' }),
-      );
+      // Paid in full. The bases differ to date by the 0.25 alone: a credit
+      // on receivables on the accrual basis (900.00 - 300.00 - 600.25),
+      // income on the cash basis.
+      expect(await balances({ basis: 'accrual' })).toEqual({
+        '1010': '300.00',
+        '1200': '-0.25',
+        '1300': '600.25',
+        '4000': '-600.00',
+        '4100': '-300.00',
+      });
+      expect(await balances({ basis: 'cash' })).toEqual({
+        '1010': '300.00',
+        '1300': '600.25',
+        '4000': '-600.00',
+        '4100': '-300.00',
+        '4900': '-0.25',
+      });
     });
 
     it('settle the invoice', async () => {
       const read = (await get(`/ledger/invoices/${i1.id}`)).body.data;
 
-      expect([read.status, read.balance, read.paid_at]).toEqual([
+      expect([read.status, read.balance, read.paid_on]).toEqual([
         'paid',
         '0.00',
-        '2031-06-02T18:00:00.000Z',
+        '2031-06-02',
       ]);
       expect(read.payments.map((p: any) => [p.payment_id, p.amount])).toEqual([
         [q1.id, '300.00'],
         [q2.id, '600.00'],
       ]);
       expect(read.payments[0].payment).toEqual(q1);
+      // Version 1 as made, and one more for each of the two payments on it.
+      expect(read.version).toBe(3);
     });
 
     it('show in the feed under their own names', async () => {
@@ -456,12 +524,12 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
           e.source_type,
           e.source_id,
           e.number,
-          e.posted_at,
+          e.posted_on,
         ]),
       ).toEqual([
-        ['sale_invoice', i1.id, 'A-17', '2031-03-12T18:00:00.000Z'],
-        ['payment_received', q1.id, null, '2031-04-08T18:00:00.000Z'],
-        ['payment_received', q2.id, null, '2031-06-02T18:00:00.000Z'],
+        ['sale_invoice', i1.id, 'A-17', '2031-03-12'],
+        ['payment_received', q1.id, null, '2031-04-08'],
+        ['payment_received', q2.id, null, '2031-06-02'],
       ]);
       // Its lines in the order sent, then receivables.
       expect(
@@ -480,25 +548,25 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         expect(errorType(res)).toBe(type);
       };
       await refused(
-        payment('2031-06-03T18:00:00Z', '0.01', [[i1.id, '0.01']]),
+        payment('2031-06-03', '0.01', [[i1.id, '0.01']]),
         'INVOICE_ALLOCATION_EXCEEDS_BALANCE',
       );
       await refused(
-        payment('2031-06-03T18:00:00Z', '1.00', [[i1.id, '2.00']]),
+        payment('2031-06-03', '1.00', [[i1.id, '2.00']]),
         'PAYMENT_AMOUNT_BELOW_ALLOCATIONS',
       );
       await refused(
-        payment('2031-06-03T18:00:00Z', '1.00', [[99999999, '1.00']]),
+        payment('2031-06-03', '1.00', [[99999999, '1.00']]),
         'PAYMENT_INVOICE_NOT_FOUND',
       );
       await refused(
-        payment('2031-06-03T18:00:00Z', '1.00', [[i1.id, '1.00']], {
+        payment('2031-06-03', '1.00', [[i1.id, '1.00']], {
           customer_id: other.id,
         }),
         'PAYMENT_INVOICE_OF_ANOTHER_CUSTOMER',
       );
       const { customer_id: _c, ...noCustomer } = payment(
-        '2031-06-03T18:00:00Z',
+        '2031-06-03',
         '1.00',
         [],
       );
@@ -506,7 +574,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
       const unknown = await post(
         '/ledger/invoice-payments',
-        payment('2031-06-03T18:00:00Z', '1.00', [], { customer_id: 99999999 }),
+        payment('2031-06-03', '1.00', [], { customer_id: 99999999 }),
       );
       expect(unknown.status).toBe(404);
       expect(errorType(unknown)).toBe('customer_not_found');
@@ -516,13 +584,46 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
   describe('editing an invoice after a payment', () => {
     let edited: any;
     let paid: any;
+    let before: any;
+    // 100.00 of sales on 1 July; 50.00 paid on 5 July, all of it sales.
+    const paidRows = [
+      ['2031-07-05', 'accrual', '1010', '50.00'],
+      ['2031-07-05', 'accrual', '1200', '-50.00'],
+      ['2031-07-05', 'cash', '1010', '50.00'],
+      ['2031-07-05', 'cash', '4000', '-50.00'],
+    ];
+    const invoiceRows = [
+      ['2031-07-01', 'accrual', '1200', '100.00'],
+      ['2031-07-01', 'accrual', '4000', '-100.00'],
+    ];
+    const asMade = () => ({
+      customer_id: customer.id,
+      posted_on: '2031-07-01',
+      entries: [entry('4000', '100.00', { external_id: 'keep' })],
+    });
+    const refused = async (body: unknown, changed: string[]) => {
+      const res = await put(`/ledger/invoices/${edited.id}`, body);
+      expect(res.status).toBe(400);
+      expect(errorType(res)).toBe('INVOICE_EDIT_HAS_PAYMENTS');
+      expect(error(res).payload).toEqual({
+        invoiceId: edited.id,
+        paid: '50.00',
+        changed,
+      });
+    };
+    const unchanged = async () => {
+      expect((await get(`/ledger/invoices/${edited.id}`)).body.data).toEqual(
+        before,
+      );
+      expect(await rowsOf('SaleInvoice', edited.id)).toEqual(invoiceRows);
+      expect(await rowsOf('PaymentReceive', paid.id)).toEqual(paidRows);
+    };
 
     beforeAll(async () => {
-      // 100.00 of sales on 1 July; 50.00 paid on 5 July.
       edited = (
         await post(
           '/ledger/invoices',
-          invoice('2031-07-01T17:00:00Z', [
+          invoice('2031-07-01', [
             entry('4000', '100.00', { external_id: 'keep' }),
           ]),
         )
@@ -530,68 +631,181 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       paid = (
         await post(
           '/ledger/invoice-payments',
-          payment('2031-07-05T17:00:00Z', '50.00', [[edited.id, '50.00']], {
+          payment('2031-07-05', '50.00', [[edited.id, '50.00']], {
             account_id: id['1010'],
           }),
         )
       ).body.data;
-      expect(await rowsOf('PaymentReceive', paid.id)).toEqual([
-        ['2031-07-05', 'accrual', '1010', '50.00'],
-        ['2031-07-05', 'accrual', '1200', '-50.00'],
-        ['2031-07-05', 'cash', '1010', '50.00'],
-        ['2031-07-05', 'cash', '4000', '-50.00'],
-      ]);
+      before = (await get(`/ledger/invoices/${edited.id}`)).body.data;
+      // Made at 1, and one more for the payment.
+      expect([before.version, before.balance]).toEqual([2, '50.00']);
+      expect(await rowsOf('PaymentReceive', paid.id)).toEqual(paidRows);
     });
 
-    it('shares the earlier payment again over the new lines, where a bill keeps its split', async () => {
+    it('refuses a new total, below what is paid or above it, a new line, another account or another customer', async () => {
+      const body = asMade();
+
+      // 49.99 is below the 50.00 paid. It is refused for its lines, as any
+      // other total is.
+      await refused({ ...body, entries: [entry('4000', '49.99')] }, [
+        'entries',
+      ]);
+      await refused({ ...body, entries: [entry('4000', '100.01')] }, [
+        'entries',
+      ]);
+      await refused(
+        { ...body, entries: [...body.entries, entry('4100', '100.00')] },
+        ['entries'],
+      );
+      await refused({ ...body, entries: [entry('4100', '100.00')] }, [
+        'entries',
+      ]);
+      await refused({ ...body, customer_id: other.id }, ['customer']);
+      // Everything at once, named in order.
+      await refused(
+        {
+          customer_id: other.id,
+          posted_on: '2031-07-20',
+          entries: [entry('4000', '49.99')],
+        },
+        ['posted_on', 'customer', 'entries'],
+      );
+      await unchanged();
+    });
+
+    it('refuses to move its day, and the invoice and its payment stay on their days', async () => {
+      await refused({ ...asMade(), posted_on: '2031-07-20' }, ['posted_on']);
+      await unchanged();
+    });
+
+    it('takes an edit of what is still open, and leaves the payment split as it was, as a bill does', async () => {
+      const cashTags = async () =>
+        (
+          await get(`/ledger/accounts/${id['4000']}/lines`, {
+            basis: 'cash',
+            page_size: 200,
+          }).expect(200)
+        ).body.data
+          .filter(
+            (l: any) =>
+              l.source_type === 'payment_received' && l.source_id === paid.id,
+          )
+          .map((l: any) => [l.credit, l.tracking.map((t: any) => t.option)]);
+      expect(await cashTags()).toEqual([['50.00', []]]);
+
+      // The line is now 2 at 50.00, still 100.00, with no external id.
       const res = await put(`/ledger/invoices/${edited.id}`, {
         customer_id: customer.id,
-        posted_at: '2031-07-01T17:00:00Z',
+        posted_on: '2031-07-01',
+        reference: 'PO-10',
         entries: [
-          entry('4000', '100.00', { external_id: 'keep' }),
-          entry('4100', '100.00'),
+          entry('4000', '50.00', {
+            quantity: '2',
+            description: 'Two halves',
+            tracking: [{ category: 'Location', option: 'South' }],
+          }),
         ],
       });
       expect(res.status).toBe(200);
-      expect(res.body.data.amount).toBe('200.00');
-      expect(res.body.data.balance).toBe('150.00');
-      expect(res.body.data.entries[0].id).toBe(edited.entries[0].id);
-
-      // The 50.00 is now a quarter of an invoice that is half sales and
-      // half services: 25.00 to each.
-      expect(await rowsOf('PaymentReceive', paid.id)).toEqual([
-        ['2031-07-05', 'accrual', '1010', '50.00'],
-        ['2031-07-05', 'accrual', '1200', '-50.00'],
-        ['2031-07-05', 'cash', '1010', '50.00'],
-        ['2031-07-05', 'cash', '4000', '-25.00'],
-        ['2031-07-05', 'cash', '4100', '-25.00'],
-      ]);
-    });
-
-    it('leaves the payment on its own day when the invoice day moves', async () => {
-      await put(`/ledger/invoices/${edited.id}`, {
-        customer_id: customer.id,
-        posted_at: '2031-07-20T17:00:00Z',
-        entries: [
-          entry('4000', '100.00', { external_id: 'keep' }),
-          entry('4100', '100.00'),
-        ],
-      }).expect(200);
-
-      expect(
-        (await rowsOf('PaymentReceive', paid.id)).map((row) => row[0]),
-      ).toEqual(Array(5).fill('2031-07-05'));
-      expect((await rowsOf('SaleInvoice', edited.id))[0][0]).toBe('2031-07-20');
-    });
-
-    it('refuses a total below what is paid', async () => {
-      const res = await put(`/ledger/invoices/${edited.id}`, {
-        customer_id: customer.id,
-        posted_at: '2031-07-20T17:00:00Z',
-        entries: [entry('4000', '49.99')],
+      expect(res.body.data).toMatchObject({
+        id: edited.id,
+        posted_on: '2031-07-01',
+        reference: 'PO-10',
+        invoice_number: before.invoice_number,
+        amount: '100.00',
+        balance: '50.00',
+        status: 'partially_paid',
+        // 2 with the payment on it, and this edit.
+        version: 3,
       });
-      expect(res.status).toBe(400);
-      expect(errorType(res)).toBe('INVOICE_AMOUNT_BELOW_PAID');
+      // The line keeps its id by its place, though its external id is gone.
+      expect(
+        res.body.data.entries.map((e: any) => [
+          e.id,
+          e.external_id,
+          e.description,
+          e.rate,
+          e.quantity,
+          e.amount,
+          e.tracking.map((t: any) => t.option),
+        ]),
+      ).toEqual([
+        [
+          edited.entries[0].id,
+          null,
+          'Two halves',
+          '50.00',
+          '2',
+          '100.00',
+          ['South'],
+        ],
+      ]);
+
+      // The books hold what they held, and the payment's cash row on sales
+      // carries the line's new tag.
+      expect(await rowsOf('SaleInvoice', edited.id)).toEqual(invoiceRows);
+      expect(await rowsOf('PaymentReceive', paid.id)).toEqual(paidRows);
+      expect(await cashTags()).toEqual([['50.00', ['South']]]);
+    });
+
+    it('shares a later payment over what is unpaid on each line', async () => {
+      // 33.33 of sales, 33.33 of services, 33.34 held as a deposit: 100.00.
+      const thirds = (
+        await post(
+          '/ledger/invoices',
+          invoice('2031-07-06', [
+            entry('4000', '33.33'),
+            entry('4100', '33.33'),
+            entry('2200', '33.34'),
+          ]),
+        )
+      ).body.data;
+      const cashOf = async (paymentId: number) =>
+        (await rowsOf('PaymentReceive', paymentId))
+          .filter((row) => row[1] === 'cash' && row[2] !== '1010')
+          .map((row) => [row[2], row[3]]);
+      const pay = async (paidOn: string, amount: string) =>
+        (
+          await post(
+            '/ledger/invoice-payments',
+            payment(paidOn, amount, [[thirds.id, amount]], {
+              account_id: id['1010'],
+            }),
+          )
+        ).body.data;
+
+      // 10.00 is a tenth: 333.3, 333.3 and 333.4 cents round down to 333
+      // each, and the cent left goes to the line that lost the most.
+      const first = await pay('2031-07-07', '10.00');
+      expect(await cashOf(first.id)).toEqual([
+        ['2200', '-3.34'],
+        ['4000', '-3.33'],
+        ['4100', '-3.33'],
+      ]);
+      // Unpaid now: 30.00 on every line. 50.00 over three equal parts is
+      // 1,666 cents and two thirds each: 1,666 each, and the two cents left
+      // go to the two earlier lines. Shared over the lines' own amounts, the
+      // odd one out would have been services.
+      const second = await pay('2031-07-08', '50.00');
+      expect(await cashOf(second.id)).toEqual([
+        ['2200', '-16.66'],
+        ['4000', '-16.67'],
+        ['4100', '-16.67'],
+      ]);
+      // The 40.00 left is what is left on each line: 13.33, 13.33 and
+      // 13.34, so each line is paid its own amount.
+      const last = await pay('2031-07-09', '40.00');
+      expect(await cashOf(last.id)).toEqual([
+        ['2200', '-13.34'],
+        ['4000', '-13.33'],
+        ['4100', '-13.33'],
+      ]);
+      const read = (await get(`/ledger/invoices/${thirds.id}`)).body.data;
+      expect([read.status, read.balance, read.paid_on]).toEqual([
+        'paid',
+        '0.00',
+        '2031-07-09',
+      ]);
     });
   });
 
@@ -599,7 +813,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     it('refuses a total below zero, and takes a negative line while the total is not', async () => {
       const negative = await post(
         '/ledger/invoices',
-        invoice('2031-08-01T17:00:00Z', [
+        invoice('2031-08-01', [
           entry('4000', '20.00'),
           entry('4100', '-70.00'),
         ]),
@@ -609,7 +823,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
       const mixed = await post(
         '/ledger/invoices',
-        invoice('2031-08-01T17:00:00Z', [
+        invoice('2031-08-01', [
           entry('4000', '70.00'),
           entry('4100', '-20.00'),
         ]),
@@ -627,21 +841,15 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     it('an invoice of zero, or of no lines, is paid from the start', async () => {
       const zero = await post(
         '/ledger/invoices',
-        invoice('2031-08-01T17:00:00Z', [
-          entry('4000', '5.00'),
-          entry('4100', '-5.00'),
-        ]),
+        invoice('2031-08-01', [entry('4000', '5.00'), entry('4100', '-5.00')]),
       );
       expect(zero.body.data).toMatchObject({ status: 'paid', amount: '0.00' });
 
-      const empty = await post(
-        '/ledger/invoices',
-        invoice('2031-08-01T17:00:00Z', []),
-      );
+      const empty = await post('/ledger/invoices', invoice('2031-08-01', []));
       expect(empty.body.data).toMatchObject({
         status: 'paid',
         amount: '0.00',
-        paid_at: null,
+        paid_on: null,
         entries: [],
       });
     });
@@ -654,7 +862,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       owed = (
         await post(
           '/ledger/invoices',
-          invoice('2031-08-10T17:00:00Z', [entry('4100', '80.00')]),
+          invoice('2031-08-10', [entry('4100', '80.00')]),
         )
       ).body.data;
     });
@@ -662,7 +870,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     it('moves no cash: unearned revenue is debited, and on the cash basis the sales account', async () => {
       const res = await post(
         '/ledger/invoice-payments',
-        payment('2031-08-12T17:00:00Z', '30.00', [[owed.id, '30.00']], {
+        payment('2031-08-12', '30.00', [[owed.id, '30.00']], {
           method: 'CREDIT_BALANCE',
         }),
       );
@@ -679,7 +887,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     it('takes the balance from the account named', async () => {
       const res = await post(
         '/ledger/invoice-payments',
-        payment('2031-08-13T17:00:00Z', '20.00', [[owed.id, '20.00']], {
+        payment('2031-08-13', '20.00', [[owed.id, '20.00']], {
           method: 'CREDIT_BALANCE',
           redemption_account_id: id['2200'],
         }),
@@ -701,14 +909,11 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
   describe('voiding an invoice', () => {
     let voided: any;
+    let voidedBody: any;
 
     beforeAll(async () => {
-      voided = (
-        await post(
-          '/ledger/invoices',
-          invoice('2031-09-01T17:00:00Z', [entry('4000', '100.00')]),
-        )
-      ).body.data;
+      voidedBody = invoice('2031-09-01', [entry('4000', '100.00')]);
+      voided = (await post('/ledger/invoices', voidedBody)).body.data;
     });
 
     it('takes its entry out, leaves the invoice, and a second void changes nothing', async () => {
@@ -718,7 +923,9 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       expect(res.body.data).toMatchObject({
         status: 'voided',
         amount: '100.00',
-        balance: '100.00',
+        balance: '0.00',
+        // Made at 1; the void is its one change.
+        version: 2,
       });
       expect(await rowsOf('SaleInvoice', voided.id)).toEqual([]);
 
@@ -727,10 +934,10 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       expect(again.body.data).toEqual(res.body.data);
     });
 
-    it('cannot then be edited or paid, where a voided bill can', async () => {
+    it('cannot then be edited or paid', async () => {
       const edit = await put(`/ledger/invoices/${voided.id}`, {
         customer_id: customer.id,
-        posted_at: '2031-09-02T17:00:00Z',
+        posted_on: '2031-09-02',
         entries: [entry('4000', '80.00')],
       });
       expect(edit.status).toBe(400);
@@ -738,24 +945,41 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
       const pay = await post(
         '/ledger/invoice-payments',
-        payment('2031-09-05T17:00:00Z', '10.00', [[voided.id, '10.00']]),
+        payment('2031-09-05', '10.00', [[voided.id, '10.00']]),
       );
       expect(pay.status).toBe(400);
       expect(errorType(pay)).toBe('INVOICE_VOIDED');
     });
 
-    it('its external id takes a new body and stays voided', async () => {
-      const res = await post(
-        '/ledger/invoices',
-        invoice('2031-09-02T17:00:00Z', [entry('4100', '90.00')], {
+    it('its external id is never used again, with a new body or with its own', async () => {
+      const before = (await get(`/ledger/invoices/${voided.id}`)).body.data;
+      const count = (await ws.rows('ext_trade_documents')).length;
+      const bodies = [
+        invoice('2031-09-02', [entry('4100', '90.00')], {
           external_id: voided.external_id,
         }),
+        voidedBody,
+      ];
+      for (const body of bodies) {
+        const res = await post('/ledger/invoices', body);
+        expect(res.status).toBe(409);
+        expect(errorType(res)).toBe('EXTERNAL_ID_IN_USE');
+        expect(error(res).payload).toEqual({
+          kind: 'sale_invoice',
+          externalId: voided.external_id,
+          recordId: voided.id,
+          state: 'voided',
+          version: 2,
+        });
+      }
+      expect(await ws.rows('ext_trade_documents')).toHaveLength(count);
+      expect((await get(`/ledger/invoices/${voided.id}`)).body.data).toEqual(
+        before,
       );
-      expect(res.status).toBe(200);
-      expect(res.body.data).toMatchObject({
-        id: voided.id,
+      expect(before).toMatchObject({
         status: 'voided',
-        amount: '90.00',
+        amount: '100.00',
+        balance: '0.00',
       });
       expect(await rowsOf('SaleInvoice', voided.id)).toEqual([]);
     });
@@ -773,7 +997,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     const pay = (amount: string, extra = {}) =>
       post(
         '/ledger/invoice-payments',
-        payment('2031-10-05T17:00:00Z', amount, [[owed.id, amount]], {
+        payment('2031-10-05', amount, [[owed.id, amount]], {
           account_id: id['1010'],
           ...extra,
         }),
@@ -783,23 +1007,56 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       owed = (
         await post(
           '/ledger/invoices',
-          invoice('2031-10-01T17:00:00Z', [entry('4000', '100.00')]),
+          invoice('2031-10-01', [entry('4000', '100.00')]),
         )
       ).body.data;
     });
 
-    it('a repeat of the external id replaces the payment under the same id', async () => {
-      const first = await pay('40.00');
-      const again = await pay('25.00', {
-        external_id: first.body.data.external_id,
-      });
+    it('a repeat of the external id is a retry with the same body, and refused with another', async () => {
+      const externalId = `q:${randomUUID()}`;
+      const first = await pay('40.00', { external_id: externalId });
+      expect(first.status).toBe(201);
+      expect(first.body).not.toHaveProperty('replayed');
 
-      expect(again.status).toBe(200);
-      expect(again.body.data.id).toBe(first.body.data.id);
-      expect((await get(`/ledger/invoices/${owed.id}`)).body.data.balance).toBe(
-        '75.00',
-      );
+      const retry = await pay('40.00', { external_id: externalId });
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: first.body.data, replayed: true });
+
+      const again = await pay('25.00', { external_id: externalId });
+      expect(again.status).toBe(409);
+      expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+      expect(error(again).payload).toEqual({
+        kind: 'payment_received',
+        externalId,
+        recordId: first.body.data.id,
+        state: 'live',
+        version: 1,
+      });
+      // The one 40.00 of the 100.00 of sales, into the bank, and no more.
+      expect(await rowsOf('PaymentReceive', first.body.data.id)).toEqual([
+        ['2031-10-05', 'accrual', '1010', '40.00'],
+        ['2031-10-05', 'accrual', '1200', '-40.00'],
+        ['2031-10-05', 'cash', '1010', '40.00'],
+        ['2031-10-05', 'cash', '4000', '-40.00'],
+      ]);
+      const read = (await get(`/ledger/invoices/${owed.id}`)).body.data;
+      // Made at 1, and moved on once by the one payment.
+      expect([read.balance, read.payments.length, read.version]).toEqual([
+        '60.00',
+        1,
+        2,
+      ]);
+
+      // A payment is changed by deleting it and making another: 25.00 in
+      // place of the 40.00 leaves 75.00 owed.
       await del(`/ledger/invoice-payments/${first.body.data.id}`).expect(200);
+      const other25 = await pay('25.00');
+      expect(other25.status).toBe(201);
+      expect(other25.body.data.id).not.toBe(first.body.data.id);
+      const after = (await get(`/ledger/invoices/${owed.id}`)).body.data;
+      // The delete and the new payment: 2 and two more.
+      expect([after.balance, after.version]).toEqual(['75.00', 4]);
+      await del(`/ledger/invoice-payments/${other25.body.data.id}`).expect(200);
     });
 
     it('deleting takes its entries out; a second delete is not found, where a bill payment answers', async () => {
@@ -807,7 +1064,8 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       const res = await del(`/ledger/invoice-payments/${paid.id}`);
 
       expect(res.status).toBe(200);
-      expect(res.body.data).toEqual({ ...paid, allocations: [] });
+      // The delete is the payment's one change: version 2.
+      expect(res.body.data).toEqual({ ...paid, version: 2, allocations: [] });
       expect(await rowsOf('PaymentReceive', paid.id)).toEqual([]);
       expect((await get(`/ledger/invoices/${owed.id}`)).body.data.status).toBe(
         'open',
@@ -820,10 +1078,60 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         404,
       );
 
-      const fresh = await pay('10.00', { external_id: paid.external_id });
-      expect(fresh.status).toBe(201);
-      expect(fresh.body.data.id).not.toBe(paid.id);
-      await del(`/ledger/invoice-payments/${fresh.body.data.id}`).expect(200);
+      // Its external id is spent: it makes no new payment and brings none
+      // back, with another body or with the body it was made with.
+      const count = (await ws.rows('ext_payments')).length;
+      for (const amount of ['10.00', '100.00']) {
+        const fresh = await pay(amount, { external_id: paid.external_id });
+        expect(fresh.status).toBe(409);
+        expect(errorType(fresh)).toBe('EXTERNAL_ID_IN_USE');
+        expect(error(fresh).payload).toEqual({
+          kind: 'payment_received',
+          externalId: paid.external_id,
+          recordId: paid.id,
+          state: 'deleted',
+          version: null,
+        });
+      }
+      expect(await ws.rows('ext_payments')).toHaveLength(count);
+      expect((await get(`/ledger/invoice-payments/${paid.id}`)).status).toBe(
+        404,
+      );
+      expect((await get(`/ledger/invoices/${owed.id}`)).body.data.balance).toBe(
+        '100.00',
+      );
+    });
+
+    it('is not deleted from an old version, or from none', async () => {
+      const paid = (await pay('15.00')).body.data;
+      expect(paid.version).toBe(1);
+
+      const stale = await del(`/ledger/invoice-payments/${paid.id}?version=2`);
+      expect(stale.status).toBe(409);
+      expect(errorType(stale)).toBe('STALE_VERSION');
+      expect(error(stale).payload).toEqual({ current: paid });
+
+      const none = await http()
+        .delete(`/ledger/invoice-payments/${paid.id}`)
+        .set(ws.headers());
+      expect(none.status).toBe(400);
+      expect(errorType(none)).toBe('VERSION_REQUIRED');
+
+      // Still there, and the invoice owes 100.00 less its 15.00.
+      expect(
+        (await get(`/ledger/invoice-payments/${paid.id}`)).body.data,
+      ).toEqual(paid);
+      expect(await rowsOf('PaymentReceive', paid.id)).toHaveLength(4);
+      expect((await get(`/ledger/invoices/${owed.id}`)).body.data.balance).toBe(
+        '85.00',
+      );
+
+      const gone = await del(`/ledger/invoice-payments/${paid.id}?version=1`);
+      expect(gone.status).toBe(200);
+      expect(gone.body.data.version).toBe(2);
+      expect((await get(`/ledger/invoices/${owed.id}`)).body.data.balance).toBe(
+        '100.00',
+      );
     });
   });
 
@@ -848,7 +1156,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       owed = (
         await post(
           '/ledger/invoices',
-          invoice('2031-08-13T18:00:00Z', [entry('4100', '100.00')]),
+          invoice('2031-08-13', [entry('4100', '100.00')]),
         )
       ).body.data;
     });
@@ -857,7 +1165,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       const res = await post('/ledger/invoice-payments', {
         external_id: `q:${randomUUID()}`,
         customer_id: customer.id,
-        paid_at: '2031-08-20T18:00:00Z',
+        paid_on: '2031-08-20',
         amount: '150.00',
         account_id: id['1010'],
         allocations: [
@@ -884,14 +1192,18 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
 
     it('credits the account on both bases, and counts toward what is allocated', async () => {
       expect(await rowsOf('PaymentReceive', paid.id)).toEqual([
+        // The 10.00 left over: on receivables on the accrual basis, in
+        // the unapplied account on the cash basis.
+        ['2031-08-20', 'accrual', '1010', '10.00'],
         ['2031-08-20', 'accrual', '1010', '100.00'],
+        ['2031-08-20', 'accrual', '1200', '-10.00'],
         ['2031-08-20', 'accrual', '1200', '-100.00'],
-        ['2031-08-20', 'both', '1010', '10.00'],
         ['2031-08-20', 'both', '1010', '40.00'],
         ['2031-08-20', 'both', '2200', '-40.00'],
-        ['2031-08-20', 'both', '4900', '-10.00'],
+        ['2031-08-20', 'cash', '1010', '10.00'],
         ['2031-08-20', 'cash', '1010', '100.00'],
         ['2031-08-20', 'cash', '4100', '-100.00'],
+        ['2031-08-20', 'cash', '4900', '-10.00'],
       ]);
       const read = (await get(`/ledger/invoices/${owed.id}`)).body.data;
       expect(read.balance).toBe('0.00');
@@ -902,7 +1214,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       const send = (allocation: Record<string, unknown>) =>
         post('/ledger/invoice-payments', {
           customer_id: customer.id,
-          paid_at: '2031-08-21T18:00:00Z',
+          paid_on: '2031-08-21',
           amount: '5.00',
           allocations: [allocation],
         });
@@ -937,7 +1249,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
   describe('listing invoices', () => {
     it('filters by customer and by status, oldest first', async () => {
       const all = (await get('/ledger/invoices', { page_size: 200 })).body.data;
-      const instants = all.map((i: any) => i.posted_at);
+      const instants = all.map((i: any) => i.posted_on);
       expect(instants).toEqual([...instants].sort());
 
       const theirs = await get('/ledger/invoices', {
@@ -961,8 +1273,8 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
         );
       }
       const march = await get('/ledger/invoices', {
-        from: '2031-03-12T18:00:00Z',
-        to: '2031-03-12T18:00:00Z',
+        from: '2031-03-12',
+        to: '2031-03-12',
       });
       expect(march.body.data.map((i: any) => i.id)).toEqual([i1.id]);
     });
@@ -980,20 +1292,22 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       march = (
         await post(
           '/ledger/invoices',
-          invoice('2031-03-20T17:00:00Z', [entry('4000', '10.00')]),
+          invoice('2031-03-20', [entry('4000', '10.00')]),
         )
       ).body.data;
       await put('/ledger/settings', {
-        closing_at: '2031-04-01T05:00:00Z',
+        locked_through: '2031-03-31',
       }).expect(200);
     });
-    afterAll(() => put('/ledger/settings', { closing_at: null }).expect(200));
+    afterAll(() =>
+      put('/ledger/settings', { locked_through: null }).expect(200),
+    );
 
     it('refuses an invoice in the closed period, and voiding one', async () => {
       locked(
         await post(
           '/ledger/invoices',
-          invoice('2031-03-31T17:00:00Z', [entry('4000', '1.00')]),
+          invoice('2031-03-31', [entry('4000', '1.00')]),
         ),
       );
       locked(await post(`/ledger/invoices/${march.id}/void`));
@@ -1002,7 +1316,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
     it('takes a payment on an invoice in the closed period: only the day paid is looked at', async () => {
       const paid = await post(
         '/ledger/invoice-payments',
-        payment('2031-11-02T17:00:00Z', '4.00', [[march.id, '4.00']], {
+        payment('2031-11-02', '4.00', [[march.id, '4.00']], {
           account_id: id['1010'],
         }),
       );
@@ -1011,7 +1325,7 @@ describe('Ledger extension: customers, invoices and invoice payments', () => {
       locked(
         await post(
           '/ledger/invoice-payments',
-          payment('2031-03-25T17:00:00Z', '1.00', [[march.id, '1.00']], {
+          payment('2031-03-25', '1.00', [[march.id, '1.00']], {
             account_id: id['1010'],
           }),
         ),

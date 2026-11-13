@@ -2,6 +2,7 @@ import request = require('supertest');
 import { randomUUID } from 'crypto';
 import { INestApplication } from '@nestjs/common';
 import {
+  change,
   createTestApp,
   createTestWorkspace,
   dropOrganizations,
@@ -20,6 +21,9 @@ import {
  * A link moves no money: after any number of links are made and removed,
  * 6000 holds 170.00, 6100 holds 30.00, 1010 holds -100.00 and 2010 holds
  * -100.00 (balances are debits less credits).
+ *
+ * A write names tags that exist. A category or an option nobody has made,
+ * or an option that is archived, is refused, and the refusal writes nothing.
  */
 const chart = () => [
   { code: '1010', name: 'Operating', account_type: 'bank' },
@@ -40,15 +44,10 @@ describe('Ledger extension: tracking categories, options and links', () => {
   const get = (path: string, query: Record<string, unknown> = {}) =>
     http().get(path).query(query).set(ws.headers());
   const post = (path: string, body: unknown = {}) =>
-    http()
-      .post(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'post', path, ws.headers(), body);
   const put = (path: string, body: unknown) =>
-    http()
-      .put(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'put', path, ws.headers(), body);
+  const del = (path: string) => change(app, 'delete', path, ws.headers());
   const errorType = (res: request.Response) => res.body?.errors?.[0]?.type;
 
   const balances = async () =>
@@ -71,6 +70,43 @@ describe('Ledger extension: tracking categories, options and links', () => {
     (await get(`/ledger/manual-journals/${j1.id}`).expect(200)).body.data;
   const readBill = async () =>
     (await get(`/ledger/bills/${b1.id}`).expect(200)).body.data;
+  const error = (res: request.Response) => res.body?.errors?.[0];
+  /** Every category with the names of its options, as the list answers. */
+  const categories = async () =>
+    (await get('/ledger/tracking-categories').expect(200)).body.data.map(
+      (c: any) => [c.name, c.options.map((o: any) => o.name)],
+    );
+  /** How many rows each table a write could reach holds. */
+  const written = async () =>
+    Object.fromEntries(
+      await Promise.all(
+        [
+          'manual_journals',
+          'ext_trade_documents',
+          'accounts_transactions',
+          'ext_tracking_links',
+          'ext_audit_log',
+          'tracking_categories',
+          'tracking_category_options',
+        ].map(async (table) => [table, (await ws.rows(table)).length]),
+      ),
+    );
+  /** The newest audit row of a line, and how many rows the line has. */
+  const lineLog = async (subject: string, lineId: number) => {
+    const res = await get('/ledger/audit-log', {
+      subject,
+      subject_id: lineId,
+    }).expect(200);
+    return { newest: res.body.data[0], total: res.body.pagination.total };
+  };
+  const aJournal = (day: string, amount: string, tracking: unknown[]) => ({
+    external_id: `j:${randomUUID()}`,
+    posted_on: day,
+    entries: [
+      { account_id: id['6100'], debit: amount, credit: '0', tracking },
+      { account_id: id['1010'], debit: '0', credit: amount },
+    ],
+  });
 
   beforeAll(async () => {
     app = await createTestApp();
@@ -81,7 +117,7 @@ describe('Ledger extension: tracking categories, options and links', () => {
 
     const journal = await post('/ledger/manual-journals', {
       external_id: `j:${randomUUID()}`,
-      posted_at: '2031-01-15T18:00:00Z',
+      posted_on: '2031-01-15',
       entries: [
         { account_id: id['6000'], debit: '100.00', credit: '0' },
         { account_id: id['1010'], debit: '0', credit: '100.00' },
@@ -97,7 +133,7 @@ describe('Ledger extension: tracking categories, options and links', () => {
     const bill = await post('/ledger/bills', {
       external_id: `b:${randomUUID()}`,
       vendor_external_id: 'v-acme',
-      posted_at: '2031-03-10T18:00:00Z',
+      posted_on: '2031-03-10',
       entries: [
         { account_id: id['6000'], rate: '70.00' },
         { account_id: id['6100'], rate: '30.00' },
@@ -329,8 +365,14 @@ describe('Ledger extension: tracking categories, options and links', () => {
     });
 
     it('keeps its id when the journal is edited with the same assignment', async () => {
+      const crew = (await get('/ledger/tracking-categories/by-name/Crew')).body
+        .data;
+      await post(`/ledger/tracking-categories/${crew.id}/options`, {
+        name: 'day',
+      }).expect(201);
+
       const edited = await put(`/ledger/manual-journals/${j1.id}`, {
-        posted_at: '2031-01-15T18:00:00Z',
+        posted_on: '2031-01-15',
         entries: [
           {
             account_id: id['6000'],
@@ -400,36 +442,60 @@ describe('Ledger extension: tracking categories, options and links', () => {
       expect((await readJournal()).entries[0].tracking).toHaveLength(1);
     });
 
-    it('makes a category and an option it names that are new', async () => {
+    it('refuses a category it names that is new, makes none, and takes it once it is made', async () => {
+      const before = await written();
       const res = await link(
         'journal_line',
         [j1.entries[1].id],
         [{ category: 'Phase', option: 'two', option_name: 'Phase Two' }],
       );
-      expect(res.status).toBe(200);
-      expect(res.body.data[0]).toMatchObject({
-        category: 'Phase',
-        option: 'two',
-        option_name: 'Phase Two',
-      });
-      const made = await get('/ledger/tracking-categories/by-name/Phase');
-      expect(made.body.data.options).toEqual([
+      expect(res.status).toBe(400);
+      expect(error(res).type).toBe('TRACKING_CATEGORY_NOT_FOUND');
+      expect(error(res).payload).toEqual({ category: 'Phase' });
+      expect(await categories()).toEqual([
+        ['Site', ['north', 'south', 'west', 'east']],
+        ['Crew', ['day']],
+      ]);
+      expect(await written()).toEqual(before);
+      expect((await readJournal()).entries[1].tracking).toEqual([]);
+
+      await post('/ledger/tracking-categories', {
+        name: 'Phase',
+        options: [{ name: 'two', display_name: 'Phase Two' }],
+      }).expect(201);
+      // The option is shown under the name it was made with, not the link's.
+      const made = await link(
+        'journal_line',
+        [j1.entries[1].id],
+        [{ category: 'Phase', option: 'two', option_name: 'Not Taken' }],
+      );
+      expect(made.status).toBe(200);
+      expect(made.body.data).toEqual([
         {
           id: expect.any(Number),
-          name: 'two',
-          display_name: 'Phase Two',
-          active: true,
+          line_id: j1.entries[1].id,
+          category: 'Phase',
+          option: 'two',
+          option_name: 'Phase Two',
         },
+      ]);
+      expect(await categories()).toEqual([
+        ['Site', ['north', 'south', 'west', 'east']],
+        ['Crew', ['day']],
+        ['Phase', ['two']],
       ]);
     });
 
-    it('is allowed in a locked period, where an edit is not', async () => {
+    it('is refused in a locked period, as an edit is, and allowed again once unlocked', async () => {
+      const crewLink = (await readJournal()).entries[0].tracking[0].id;
+
       await put('/ledger/settings', {
-        closing_at: '2031-02-01T00:00:00-06:00',
+        locked_through: '2031-01-31',
       }).expect(200);
       try {
+        const before = await written();
         const edit = await put(`/ledger/manual-journals/${j1.id}`, {
-          posted_at: '2031-01-15T18:00:00Z',
+          posted_on: '2031-01-15',
           entries: [
             { account_id: id['6000'], debit: '1.00', credit: '0' },
             { account_id: id['1010'], debit: '0', credit: '1.00' },
@@ -438,18 +504,45 @@ describe('Ledger extension: tracking categories, options and links', () => {
         expect(edit.status).toBe(400);
         expect(errorType(edit)).toBe('TRANSACTIONS_DATE_LOCKED');
 
-        const res = await link(
+        // The journal's own day, 15 January, is the one looked at.
+        const made = await link(
           'journal_line',
           [j1.entries[1].id],
           [{ category: 'Site', option: 'west' }],
         );
-        expect(res.status).toBe(200);
-        await post('/ledger/tracking-links/remove', {
-          ids: [res.body.data[0].id],
-        }).expect(200);
+        expect(made.status).toBe(400);
+        expect(error(made).type).toBe('TRANSACTIONS_DATE_LOCKED');
+        expect(error(made).payload).toEqual({
+          lockedThrough: '2031-01-31',
+          date: '2031-01-15',
+        });
+        const removed = await post('/ledger/tracking-links/remove', {
+          ids: [crewLink],
+        });
+        expect(removed.status).toBe(400);
+        expect(error(removed).type).toBe('TRANSACTIONS_DATE_LOCKED');
+
+        expect(await written()).toEqual(before);
+        expect(
+          (await readJournal()).entries.map((e: any) =>
+            e.tracking.map((t: any) => [t.id, t.category, t.option]),
+          ),
+        ).toEqual([
+          [[crewLink, 'Crew', 'day']],
+          [[expect.any(Number), 'Phase', 'two']],
+        ]);
       } finally {
-        await put('/ledger/settings', { closing_at: null }).expect(200);
+        await put('/ledger/settings', { locked_through: null }).expect(200);
       }
+      const res = await link(
+        'journal_line',
+        [j1.entries[1].id],
+        [{ category: 'Site', option: 'west' }],
+      );
+      expect(res.status).toBe(200);
+      await post('/ledger/tracking-links/remove', {
+        ids: [res.body.data[0].id],
+      }).expect(200);
     });
   });
 
@@ -592,8 +685,8 @@ describe('Ledger extension: tracking categories, options and links', () => {
       expect(
         await by({
           tracking_category: 'Site',
-          from: '2031-01-01T06:00:00Z',
-          to: '2031-02-01T06:00:00Z',
+          from: '2031-01-01',
+          to: '2031-01-31',
         }),
       ).toEqual({});
       // On the cash basis an unpaid bill has posted nothing.
@@ -616,6 +709,564 @@ describe('Ledger extension: tracking categories, options and links', () => {
       const res = await get('/ledger/accounts', { tracking_option: 'north' });
       expect(res.status).toBe(400);
       expect(errorType(res)).toBe('TRACKING_OPTION_WITHOUT_CATEGORY');
+    });
+  });
+
+  describe('a tag nobody has made', () => {
+    it('is refused when its category is unknown, on a journal, a bill and a link, and nothing is written', async () => {
+      const before = await written();
+      const tracking = [{ category: 'Depot', option: 'a', option_name: 'A' }];
+      const refusals = [
+        await post(
+          '/ledger/manual-journals',
+          aJournal('2031-02-10', '5.00', tracking),
+        ),
+        await post('/ledger/bills', {
+          vendor_external_id: 'v-acme',
+          posted_on: '2031-03-11',
+          entries: [{ account_id: id['6000'], rate: '5.00', tracking }],
+        }),
+        await link('journal_line', [j1.entries[0].id], tracking),
+        await link('bill_line', [b1.entries[0].id], tracking),
+      ];
+      for (const res of refusals) {
+        expect(res.status).toBe(400);
+        expect(error(res).type).toBe('TRACKING_CATEGORY_NOT_FOUND');
+        expect(error(res).payload).toEqual({ category: 'Depot' });
+      }
+      expect(await written()).toEqual(before);
+      expect(await categories()).toEqual([
+        ['Site', ['north', 'south', 'west', 'east']],
+        ['Crew', ['day']],
+        ['Phase', ['two']],
+      ]);
+    });
+
+    it('is refused when its category has no such option, and the category gains none', async () => {
+      const before = await written();
+      const tracking = [
+        { category: 'Site', option: 'nowhere', option_name: 'Nowhere' },
+      ];
+      const refusals = [
+        await post(
+          '/ledger/manual-journals',
+          aJournal('2031-02-10', '5.00', tracking),
+        ),
+        await post('/ledger/bills', {
+          vendor_external_id: 'v-acme',
+          posted_on: '2031-03-11',
+          entries: [{ account_id: id['6000'], rate: '5.00', tracking }],
+        }),
+        await link('journal_line', [j1.entries[0].id], tracking),
+        await link('bill_line', [b1.entries[0].id], tracking),
+      ];
+      for (const res of refusals) {
+        expect(res.status).toBe(400);
+        expect(error(res).type).toBe('TRACKING_OPTION_NOT_FOUND');
+        expect(error(res).payload).toEqual({
+          category: 'Site',
+          option: 'nowhere',
+        });
+      }
+      expect(await written()).toEqual(before);
+      expect(await categories()).toEqual([
+        ['Site', ['north', 'south', 'west', 'east']],
+        ['Crew', ['day']],
+        ['Phase', ['two']],
+      ]);
+    });
+
+    it('refuses the whole write when one tag of several is unknown', async () => {
+      const before = await written();
+      const res = await link(
+        'journal_line',
+        [j1.entries[0].id],
+        [
+          { category: 'Site', option: 'north' },
+          { category: 'Depot', option: 'a' },
+        ],
+      );
+      expect(res.status).toBe(400);
+      expect(error(res).type).toBe('TRACKING_CATEGORY_NOT_FOUND');
+      expect(await written()).toEqual(before);
+      expect(
+        (await readJournal()).entries[0].tracking.map((t: any) => t.category),
+      ).toEqual(['Crew']);
+    });
+  });
+
+  /**
+   * J2, 10 Feb: 6100 Supplies +5.00 carrying Site: west, 1010 Operating
+   * -5.00. It is the only line carrying west, and it is deleted at the end,
+   * so the balances of the documents above stand.
+   */
+  describe('an archived option', () => {
+    let west: any;
+    let j2: any;
+    const optionPath = () =>
+      `/ledger/tracking-categories/${site.id}/options/${west.id}`;
+    const westOnly = async () =>
+      Object.fromEntries(
+        (
+          await get('/ledger/accounts', {
+            tracking_category: 'Site',
+            tracking_option: 'west',
+          }).expect(200)
+        ).body.data
+          .filter((a: any) => a.code && a.balance !== '0.00')
+          .map((a: any) => [a.code, a.balance]),
+      );
+
+    it('is archived by its category and id, and says so wherever it is read', async () => {
+      const made = await post(
+        '/ledger/manual-journals',
+        aJournal('2031-02-10', '5.00', [{ category: 'Site', option: 'west' }]),
+      );
+      expect(made.status).toBe(201);
+      j2 = made.body.data;
+      west = site.options.find((o: any) => o.name === 'west');
+
+      const archived = await put(optionPath(), { active: false });
+      expect(archived.status).toBe(200);
+      expect(archived.body.data).toEqual({
+        category: 'Site',
+        id: west.id,
+        name: 'west',
+        display_name: 'west',
+        active: false,
+      });
+      const read = await get('/ledger/tracking-categories/by-name/Site');
+      expect(
+        read.body.data.options.map((o: any) => [o.name, o.active]),
+      ).toEqual([
+        ['north', true],
+        ['south', true],
+        ['west', false],
+        ['east', true],
+      ]);
+    });
+
+    it('takes no new journal line and no new link, and nothing is written', async () => {
+      const before = await written();
+      const tracking = [{ category: 'Site', option: 'west' }];
+      const refusals = [
+        await post(
+          '/ledger/manual-journals',
+          aJournal('2031-02-11', '7.00', tracking),
+        ),
+        await link('journal_line', [j1.entries[1].id], tracking),
+        await link('bill_line', [b1.entries[0].id], tracking),
+      ];
+      for (const res of refusals) {
+        expect(res.status).toBe(400);
+        expect(error(res).type).toBe('TRACKING_OPTION_ARCHIVED');
+        expect(error(res).payload).toEqual({
+          category: 'Site',
+          option: 'west',
+        });
+      }
+      expect(await written()).toEqual(before);
+      expect(
+        (await readJournal()).entries[1].tracking.map((t: any) => t.category),
+      ).toEqual(['Phase']);
+      expect((await readBill()).entries[0].tracking).toEqual([]);
+    });
+
+    it('stays on the line that carries it, which still reads it', async () => {
+      const read = (await get(`/ledger/manual-journals/${j2.id}`).expect(200))
+        .body.data;
+      expect(read.entries[0].tracking).toEqual([
+        {
+          id: j2.entries[0].tracking[0].id,
+          category: 'Site',
+          option: 'west',
+          option_name: 'west',
+        },
+      ]);
+      // 6100 holds the bill's line of 10 March first, then J2's of 10 Feb.
+      expect((await accountLineTracking('6100'))[1]).toEqual([
+        { category: 'Site', option: 'west', option_name: 'west' },
+      ]);
+      expect(await westOnly()).toEqual({ '6100': '5.00' });
+    });
+
+    it('is kept by an edit of the journal that carries it, and taken by no other', async () => {
+      // The same journal sent again with another description: taken, the
+      // archived tag still on its line and its 5.00 still counted.
+      const body = (externalId: string) => ({
+        ...aJournal('2031-02-10', '5.00', [
+          { category: 'Site', option: 'west' },
+        ]),
+        external_id: externalId,
+        description: 'Sent again',
+      });
+      const edited = await put(
+        `/ledger/manual-journals/${j2.id}`,
+        body(j2.external_id),
+      );
+      expect(edited.status).toBe(200);
+      expect(
+        edited.body.data.entries[0].tracking.map((t: any) => [
+          t.category,
+          t.option,
+        ]),
+      ).toEqual([['Site', 'west']]);
+      expect(await westOnly()).toEqual({ '6100': '5.00' });
+
+      // The same edit of the first journal, which does not carry it: refused.
+      const other = await put(
+        `/ledger/manual-journals/${j1.id}`,
+        body(j1.external_id),
+      );
+      expect(other.status).toBe(400);
+      expect(errorType(other)).toBe('TRACKING_OPTION_ARCHIVED');
+    });
+
+    it('takes a display name while archived, and stays archived', async () => {
+      const renamed = await put(optionPath(), { display_name: 'West Gate' });
+      expect(renamed.status).toBe(200);
+      expect(renamed.body.data).toEqual({
+        category: 'Site',
+        id: west.id,
+        name: 'west',
+        display_name: 'West Gate',
+        active: false,
+      });
+    });
+
+    it('is restored, and takes a new line and a new link again', async () => {
+      const restored = await put(optionPath(), { active: true });
+      expect(restored.status).toBe(200);
+      expect(restored.body.data).toEqual({
+        category: 'Site',
+        id: west.id,
+        name: 'west',
+        display_name: 'West Gate',
+        active: true,
+      });
+
+      const tracking = [{ category: 'Site', option: 'west' }];
+      const linked = await link('journal_line', [j1.entries[1].id], tracking);
+      expect(linked.status).toBe(200);
+      expect(linked.body.data).toEqual([
+        {
+          id: expect.any(Number),
+          line_id: j1.entries[1].id,
+          category: 'Site',
+          option: 'west',
+          option_name: 'West Gate',
+        },
+      ]);
+      const j3 = await post(
+        '/ledger/manual-journals',
+        aJournal('2031-02-11', '7.00', tracking),
+      );
+      expect(j3.status).toBe(201);
+      // J2's 5.00 and J3's 7.00 on 6100; J1's -100.00 on 1010.
+      expect(await westOnly()).toEqual({ '6100': '12.00', '1010': '-100.00' });
+
+      // The books are left as the documents at the top make them.
+      await post('/ledger/tracking-links/remove', {
+        ids: [linked.body.data[0].id],
+      }).expect(200);
+      await del(`/ledger/manual-journals/${j3.body.data.id}`).expect(200);
+      await del(`/ledger/manual-journals/${j2.id}`).expect(200);
+      expect(await westOnly()).toEqual({});
+    });
+
+    it('refuses a value for active that is not true or false', async () => {
+      await put(optionPath(), { active: 'no' }).expect(400);
+      const read = await get('/ledger/tracking-categories/by-name/Site');
+      expect(
+        read.body.data.options.find((o: any) => o.name === 'west'),
+      ).toEqual({
+        id: west.id,
+        name: 'west',
+        display_name: 'West Gate',
+        active: true,
+      });
+    });
+  });
+
+  /**
+   * J1's line on 6000 carries Crew: day, and J1 is dated 15 January. B1's
+   * line on 6100 carries Site: north, and B1 is dated 10 March.
+   */
+  describe('a retag', () => {
+    let crewLink: number;
+    const night = [{ category: 'Crew', option: 'night' }];
+
+    beforeAll(async () => {
+      const crew = (await get('/ledger/tracking-categories/by-name/Crew')).body
+        .data;
+      await post(`/ledger/tracking-categories/${crew.id}/options`, {
+        name: 'night',
+      }).expect(201);
+      crewLink = (await readJournal()).entries[0].tracking[0].id;
+    });
+
+    it('is refused in a locked period, and the line, its ledger rows and the log stay as they were', async () => {
+      await put('/ledger/settings', {
+        locked_through: '2031-03-31',
+      }).expect(200);
+      try {
+        const before = await written();
+        const onJournal = await link('journal_line', [j1.entries[0].id], night);
+        expect(onJournal.status).toBe(400);
+        expect(error(onJournal).type).toBe('TRANSACTIONS_DATE_LOCKED');
+        expect(error(onJournal).payload).toEqual({
+          lockedThrough: '2031-03-31',
+          date: '2031-01-15',
+        });
+        // A bill is looked at on the day it was posted on, 10 March.
+        const onBill = await link(
+          'bill_line',
+          [b1.entries[1].id],
+          [{ category: 'Site', option: 'south' }],
+        );
+        expect(onBill.status).toBe(400);
+        expect(error(onBill).type).toBe('TRANSACTIONS_DATE_LOCKED');
+        expect(error(onBill).payload).toEqual({
+          lockedThrough: '2031-03-31',
+          date: '2031-03-10',
+        });
+
+        expect(await written()).toEqual(before);
+        expect((await readJournal()).entries[0].tracking).toEqual([
+          { id: crewLink, category: 'Crew', option: 'day', option_name: 'day' },
+        ]);
+        expect((await accountLineTracking('6000'))[1]).toEqual([
+          { category: 'Crew', option: 'day', option_name: 'day' },
+        ]);
+        expect(
+          (await readBill()).entries[1].tracking.map((t: any) => t.option),
+        ).toEqual(['north']);
+      } finally {
+        await put('/ledger/settings', { locked_through: null }).expect(200);
+      }
+    });
+
+    it('is let through a locked period by an exception covering the day', async () => {
+      const lineId = b1.entries[1].id;
+      const { total } = await lineLog('bill_entry', lineId);
+
+      await put('/ledger/settings', {
+        locked_through: '2031-03-31',
+      }).expect(200);
+      try {
+        const exception = await http()
+          .post('/ledger/lock-exceptions')
+          .set({ ...ws.headers(), 'x-ledger-actor': 'ana' })
+          .send({
+            from: '2031-03-01',
+            to: '2031-03-31',
+            reason: 'A March bill was tagged late',
+            expires_at: '2999-01-01T00:00:00.000Z',
+          });
+        expect(exception.status).toBe(201);
+
+        // March is open again; January is not.
+        const onJournal = await link('journal_line', [j1.entries[0].id], night);
+        expect(onJournal.status).toBe(400);
+        expect(error(onJournal).type).toBe('TRANSACTIONS_DATE_LOCKED');
+
+        const onBill = await link(
+          'bill_line',
+          [lineId],
+          [{ category: 'Site', option: 'south' }],
+        );
+        expect(onBill.status).toBe(200);
+
+        await http()
+          .post(`/ledger/lock-exceptions/${exception.body.data.id}/revoke`)
+          .set({ ...ws.headers(), 'x-ledger-actor': 'ana' })
+          .expect(200);
+      } finally {
+        await put('/ledger/settings', { locked_through: null }).expect(200);
+      }
+      // The bill's line is logged with the option it had and the one it has.
+      const log = await lineLog('bill_entry', lineId);
+      expect(log.total).toBe(total + 1);
+      expect(log.newest).toEqual({
+        id: expect.any(Number),
+        action: 'edit',
+        subject: 'bill_entry',
+        subject_id: lineId,
+        number: null,
+        actor: null,
+        before: { tracking: [{ category: 'Site', option: 'north' }] },
+        after: { tracking: [{ category: 'Site', option: 'south' }] },
+        created_at: expect.any(String),
+      });
+      // The 30.00 of that line moved from north to south with it.
+      const south = (
+        await get('/ledger/accounts', {
+          tracking_category: 'Site',
+          tracking_option: 'south',
+        }).expect(200)
+      ).body.data.find((a: any) => a.code === '6100');
+      expect(south.balance).toBe('30.00');
+    });
+
+    it('in an open period is logged on the line with both values, exactly', async () => {
+      const lineId = j1.entries[0].id;
+      const { total } = await lineLog('manual_journal_entry', lineId);
+      const untouched = await lineLog('manual_journal_entry', j1.entries[1].id);
+
+      const res = await link('journal_line', [lineId], night);
+      expect(res.status).toBe(200);
+      expect(res.body.data).toEqual([
+        {
+          id: crewLink,
+          line_id: lineId,
+          category: 'Crew',
+          option: 'night',
+          option_name: 'night',
+        },
+      ]);
+
+      const log = await lineLog('manual_journal_entry', lineId);
+      expect(log.total).toBe(total + 1);
+      expect(log.newest).toEqual({
+        id: expect.any(Number),
+        action: 'edit',
+        subject: 'manual_journal_entry',
+        subject_id: lineId,
+        number: null,
+        actor: null,
+        before: { tracking: [{ category: 'Crew', option: 'day' }] },
+        after: { tracking: [{ category: 'Crew', option: 'night' }] },
+        created_at: expect.any(String),
+      });
+      // The other line of the journal was not changed, and has no new row.
+      expect(
+        (await lineLog('manual_journal_entry', j1.entries[1].id)).total,
+      ).toBe(untouched.total);
+    });
+
+    it('of several lines at once is logged once for each line', async () => {
+      const lineIds = b1.entries.map((e: any) => e.id);
+      const totals = await Promise.all(
+        lineIds.map((lineId: number) => lineLog('bill_entry', lineId)),
+      );
+      await link('bill_line', lineIds, [
+        { category: 'Phase', option: 'two' },
+      ]).expect(200);
+
+      // The first line carried nothing; the second carries Site: south.
+      const logs = await Promise.all(
+        lineIds.map((lineId: number) => lineLog('bill_entry', lineId)),
+      );
+      expect(logs.map((log) => log.total)).toEqual(
+        totals.map((log) => log.total + 1),
+      );
+      expect(logs.map((log) => [log.newest.before, log.newest.after])).toEqual([
+        [
+          { tracking: [] },
+          { tracking: [{ category: 'Phase', option: 'two' }] },
+        ],
+        [
+          { tracking: [{ category: 'Site', option: 'south' }] },
+          {
+            tracking: [
+              { category: 'Site', option: 'south' },
+              { category: 'Phase', option: 'two' },
+            ],
+          },
+        ],
+      ]);
+    });
+  });
+
+  describe('a link removed', () => {
+    it('is logged on its line with what the line carried and what it is left with', async () => {
+      const lineId = b1.entries[1].id;
+      const { total } = await lineLog('bill_entry', lineId);
+      const links = (await readBill()).entries[1].tracking;
+      const siteLink = links.find((t: any) => t.category === 'Site').id;
+
+      await post('/ledger/tracking-links/remove', {
+        ids: [siteLink],
+      }).expect(200);
+
+      const log = await lineLog('bill_entry', lineId);
+      expect(log.total).toBe(total + 1);
+      expect(log.newest).toEqual({
+        id: expect.any(Number),
+        action: 'edit',
+        subject: 'bill_entry',
+        subject_id: lineId,
+        number: null,
+        actor: null,
+        before: {
+          tracking: [
+            { category: 'Site', option: 'south' },
+            { category: 'Phase', option: 'two' },
+          ],
+        },
+        after: { tracking: [{ category: 'Phase', option: 'two' }] },
+        created_at: expect.any(String),
+      });
+    });
+
+    it('from a journal line is logged the same way, down to no tag at all', async () => {
+      const lineId = j1.entries[0].id;
+      const { total } = await lineLog('manual_journal_entry', lineId);
+      const [crewLink] = (await readJournal()).entries[0].tracking;
+
+      await post('/ledger/tracking-links/remove', {
+        ids: [crewLink.id],
+      }).expect(200);
+
+      const log = await lineLog('manual_journal_entry', lineId);
+      expect(log.total).toBe(total + 1);
+      expect(log.newest).toEqual({
+        id: expect.any(Number),
+        action: 'edit',
+        subject: 'manual_journal_entry',
+        subject_id: lineId,
+        number: null,
+        actor: null,
+        before: { tracking: [{ category: 'Crew', option: 'night' }] },
+        after: { tracking: [] },
+        created_at: expect.any(String),
+      });
+      expect((await readJournal()).entries[0].tracking).toEqual([]);
+    });
+
+    it('is refused in a locked period and writes no row', async () => {
+      const lineId = b1.entries[0].id;
+      const [phaseLink] = (await readBill()).entries[0].tracking;
+
+      await put('/ledger/settings', {
+        locked_through: '2031-03-10',
+      }).expect(200);
+      try {
+        const before = await written();
+        const res = await post('/ledger/tracking-links/remove', {
+          ids: [phaseLink.id],
+        });
+        expect(res.status).toBe(400);
+        expect(error(res).type).toBe('TRANSACTIONS_DATE_LOCKED');
+        expect(error(res).payload).toEqual({
+          lockedThrough: '2031-03-10',
+          date: '2031-03-10',
+        });
+        expect(await written()).toEqual(before);
+      } finally {
+        await put('/ledger/settings', { locked_through: null }).expect(200);
+      }
+      expect((await readBill()).entries[0].tracking).toEqual([
+        {
+          id: phaseLink.id,
+          category: 'Phase',
+          option: 'two',
+          option_name: 'Phase Two',
+        },
+      ]);
+      expect((await lineLog('bill_entry', lineId)).newest.after).toEqual({
+        tracking: [{ category: 'Phase', option: 'two' }],
+      });
     });
   });
 

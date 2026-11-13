@@ -6,7 +6,6 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { isISO8601 } from 'class-validator';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ApiCommonHeaders } from '@/common/decorators/ApiCommonHeaders';
 import { LedgerWorkspaceGuard } from '../Workspaces/LedgerWorkspace.guard';
@@ -33,16 +32,9 @@ export class LedgerEntriesController {
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    if (sort !== undefined && sort !== 'posted_at') {
-      throw new BadRequestException('Entries are sorted by posted_at only.');
+    if (sort !== undefined && sort !== 'posted_on') {
+      throw new BadRequestException('Entries are sorted by posted_on only.');
     }
-    [from, to].forEach((instant) => {
-      if (instant !== undefined && !isISO8601(instant, { strict: true })) {
-        throw new BadRequestException(
-          'from and to must be ISO-8601 timestamps.',
-        );
-      }
-    });
     return this.entries.feed({
       page,
       pageSize,

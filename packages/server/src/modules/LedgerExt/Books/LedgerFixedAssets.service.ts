@@ -1,4 +1,9 @@
 import { Knex } from 'knex';
+import {
+  raiseVersion,
+  refusingStale,
+  requireVersion,
+} from '../common/versions';
 import { HttpStatus, Inject, Injectable } from '@nestjs/common';
 import { ServiceError } from '@/modules/Items/ServiceError';
 import { TENANCY_DB_CONNECTION } from '@/modules/Tenancy/TenancyDB/TenancyDB.constants';
@@ -7,7 +12,7 @@ import { ExternalIdsService } from '../common/ExternalIds.service';
 import { ExtMetadataService } from '../common/ExtMetadata.service';
 import { LedgerPostingsService } from '../common/LedgerPostings.service';
 import { fromCents, toCents } from '../common/money';
-import { toInstant } from '../common/timestamps';
+import { toPlainDate } from '../common/timestamps';
 import { ExtRecordKind } from '../LedgerExt.constants';
 import {
   LedgerAccountBrief,
@@ -22,7 +27,7 @@ import {
   VALUE_UPDATE_REFERENCE,
   paging,
 } from './books.constants';
-import { OpeningEntriesService } from './OpeningEntries.service';
+import { FundingView, OpeningEntriesService } from './OpeningEntries.service';
 import {
   CreateLedgerFixedAssetDto,
   CreateLedgerValueUpdateDto,
@@ -35,6 +40,8 @@ const UPDATES_TABLE = 'ext_asset_value_updates';
 export interface FixedAssetView {
   id: number;
   externalId: string | null;
+  /** Raised by every change to the asset's fields. */
+  version: number;
   name: string;
   assetType: string;
   cost: string;
@@ -44,7 +51,8 @@ export interface FixedAssetView {
   /** The asset's own account, made with it. */
   account: LedgerAccountBrief | null;
   accumulatedAccount: LedgerAccountBrief | null;
-  opening: { amount: string; postedAt: string } | null;
+  /** The entry the asset was recorded with, and where its other side went. */
+  funding: FundingView | null;
   createdAt: string | null;
 }
 
@@ -54,7 +62,7 @@ export interface ValueUpdateView {
   assetId: number;
   amount: string;
   updateType: string;
-  postedAt: string;
+  postedOn: string;
   note: string | null;
   counterAccount: LedgerAccountBrief | null;
   createdAt: string | null;
@@ -73,7 +81,9 @@ const named = (value: unknown): boolean =>
  *
  * An asset is made with an account of its own, a fixed asset account under
  * the account the chart marks `fixed-assets` (or under the root of the
- * assets when it marks none). Its value falls by value updates, each one
+ * assets when it marks none). Its cost is entered against the account it
+ * was paid from, or against opening balance equity when it was held before
+ * the books began. Its value falls by value updates, each one
  * entry: a debit to a counter account, a credit to the asset's accumulated
  * account.
  */
@@ -93,23 +103,31 @@ export class LedgerFixedAssetsService {
   ) {}
 
   /**
-   * Creates an asset, its account and, when given, its opening entry, in
+   * Creates an asset, its account and, when given, the entry of its cost, in
    * one transaction. A create carrying the external id of an existing asset
-   * answers that asset unchanged.
+   * is a retry when its body is the one the asset was made with; otherwise
+   * it is refused.
    */
-  public async create(dto: CreateLedgerFixedAssetDto): Promise<FixedAssetView> {
+  public async create(
+    dto: CreateLedgerFixedAssetDto,
+  ): Promise<{ asset: FixedAssetView; replayed: boolean }> {
     const accumulatedAccountId = await this.accountNamed(
       dto.accumulatedAccountId,
       dto.accumulatedAccountSlug,
       false,
     );
-    const openingAt = dto.opening ? toInstant(dto.opening.postedAt) : null;
+    const funding = await this.openings.prepareFunding(dto.funding);
 
-    const { recordId } = await this.externalIds.createOnce({
+    const { recordId, replayed } = await this.externalIds.createOnce({
       kind: ExtRecordKind.FixedAsset,
       externalId: dto.externalId ?? undefined,
+      body: dto,
+      describe: async (id) => ({
+        state: 'live' as const,
+        version: Number((await this.rowOrThrow(id)).version),
+      }),
       create: async (trx) => {
-        if (openingAt) await this.lock.assertOpen([openingAt], trx);
+        if (funding) await this.lock.assertOpen([funding.postedOn], trx);
 
         const parentAccountId =
           (await this.marked.find('fixed-assets', trx)) ??
@@ -137,14 +155,15 @@ export class LedgerFixedAssetsService {
           dto.metadata ?? null,
           trx,
         );
-        if (openingAt) {
+        if (funding) {
           await this.openings.post(
             {
               source: 'fixed_asset',
               sourceId: id,
               accountId,
-              cents: toCents(dto.opening.amount),
-              postedAt: openingAt,
+              cents: funding.cents,
+              postedOn: funding.postedOn,
+              againstAccountId: funding.againstAccountId,
             },
             trx,
           );
@@ -153,7 +172,7 @@ export class LedgerFixedAssetsService {
       },
       read: async (id) => id,
     });
-    return this.get(recordId);
+    return { asset: await this.get(recordId), replayed };
   }
 
   /**
@@ -186,17 +205,24 @@ export class LedgerFixedAssetsService {
         false,
       );
     }
-    await this.uow.withTransaction(async (trx) => {
-      await trx(ASSETS_TABLE)
-        .where({ id: assetId })
-        .update({ ...changes, updatedAt: trx.fn.now() });
-      await this.metadata.set(
-        ExtRecordKind.FixedAsset,
-        assetId,
-        dto.metadata,
-        trx,
-      );
-    });
+    const version = requireVersion(dto.version);
+
+    await refusingStale(
+      () =>
+        this.uow.withTransaction(async (trx) => {
+          await raiseVersion(trx, ASSETS_TABLE, { id: assetId }, version);
+          await trx(ASSETS_TABLE)
+            .where({ id: assetId })
+            .update({ ...changes, updatedAt: trx.fn.now() });
+          await this.metadata.set(
+            ExtRecordKind.FixedAsset,
+            assetId,
+            dto.metadata,
+            trx,
+          );
+        }),
+      () => this.get(assetId),
+    );
     return this.get(assetId);
   }
 
@@ -231,18 +257,19 @@ export class LedgerFixedAssetsService {
    */
   public async createValueUpdate(
     dto: CreateLedgerValueUpdateDto,
-  ): Promise<ValueUpdateView> {
+  ): Promise<{ update: ValueUpdateView; replayed: boolean }> {
     const asset = await this.rowOrThrow(dto.assetId);
     const counterAccountId = await this.accountNamed(
       dto.counterAccountId,
       dto.counterAccountSlug,
       true,
     );
-    const postedAt = toInstant(dto.postedAt);
+    const postedOn = toPlainDate(dto.postedOn);
 
-    const { recordId } = await this.externalIds.createOnce({
+    const { recordId, replayed } = await this.externalIds.createOnce({
       kind: ExtRecordKind.FixedAssetValueUpdate,
       externalId: dto.externalId ?? undefined,
+      body: dto,
       create: async (trx) => {
         const held = await trx(ASSETS_TABLE)
           .where({ id: asset.id })
@@ -256,14 +283,14 @@ export class LedgerFixedAssetsService {
             { assetId: Number(asset.id) },
           );
         }
-        await this.lock.assertOpen([postedAt], trx);
+        await this.lock.assertOpen([postedOn], trx);
 
         const cents = toCents(dto.amount);
         const [id] = await trx(UPDATES_TABLE).insert({
           assetId: Number(asset.id),
           updateType: dto.updateType,
           amount: fromCents(cents),
-          postedAt,
+          postedOn,
           note: dto.note ?? null,
           counterAccountId,
           createdAt: trx.fn.now(),
@@ -272,11 +299,11 @@ export class LedgerFixedAssetsService {
         await this.postings.replace(
           await this.openings.context(VALUE_UPDATE_REFERENCE, id),
           [
-            { accountId: counterAccountId, cents, postedAt, basis: null },
+            { accountId: counterAccountId, cents, postedOn, basis: null },
             {
               accountId: Number(held.accumulatedAccountId),
               cents: -cents,
-              postedAt,
+              postedOn,
               basis: null,
             },
           ],
@@ -286,7 +313,10 @@ export class LedgerFixedAssetsService {
       },
       read: async (id) => id,
     });
-    return (await this.valueUpdateViews([recordId]))[0];
+    return {
+      update: (await this.valueUpdateViews([recordId]))[0],
+      replayed,
+    };
   }
 
   /** Value updates, oldest dated first, of one asset when one is named. */
@@ -306,7 +336,7 @@ export class LedgerFixedAssetsService {
     const [{ total }] = await scoped().count({ total: '*' });
     const rows = await scoped()
       .orderBy([
-        { column: 'postedAt', order: 'asc' },
+        { column: 'postedOn', order: 'asc' },
         { column: 'id', order: 'asc' },
       ])
       .limit(pageSize)
@@ -345,7 +375,7 @@ export class LedgerFixedAssetsService {
       return this.marked.get(slug);
     }
     if (named(accountId)) {
-      await this.accounts.assertPresented([accountId]);
+      await this.accounts.assertPostable([accountId]);
       return accountId;
     }
     if (required) {
@@ -385,6 +415,7 @@ export class LedgerFixedAssetsService {
         return {
           id,
           externalId: externalIds.get(id) ?? null,
+          version: Number(row.version),
           name: row.name,
           assetType: row.assetType,
           cost: fromCents(toCents(String(row.cost))),
@@ -399,9 +430,7 @@ export class LedgerFixedAssetsService {
           accumulatedAccount: named(row.accumulatedAccountId)
             ? (briefs.get(Number(row.accumulatedAccountId)) ?? null)
             : null,
-          opening: opening
-            ? { amount: opening.amount, postedAt: opening.postedAt }
-            : null,
+          funding: this.openings.fundingView(opening, 1),
           createdAt: toIso(row.createdAt),
         };
       });
@@ -431,7 +460,7 @@ export class LedgerFixedAssetsService {
           assetId: Number(row.assetId),
           amount: fromCents(toCents(String(row.amount))),
           updateType: row.updateType,
-          postedAt: row.postedAt,
+          postedOn: row.postedOn,
           note: row.note ?? null,
           counterAccount: briefs.get(Number(row.counterAccountId)) ?? null,
           createdAt: toIso(row.createdAt),

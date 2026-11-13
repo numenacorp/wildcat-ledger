@@ -122,11 +122,15 @@ export class LedgerTrackingCategoriesService {
     };
   }
 
-  /** Changes the name an option is shown under. */
-  public async renameOption(
+  /**
+   * Changes the name an option is shown under, or archives or restores it.
+   * An archived option stays on the lines that carry it and takes no new
+   * one.
+   */
+  public async updateOption(
     categoryId: number,
     optionId: number,
-    displayName: string,
+    changes: { displayName?: string; active?: boolean },
   ): Promise<TrackingOptionView & { category: string }> {
     const knex = this.tenantKnex();
 
@@ -144,10 +148,17 @@ export class LedgerTrackingCategoriesService {
         HttpStatus.NOT_FOUND,
       );
     }
-    await knex('ext_tracking_option_names')
-      .insert({ optionId, name: displayName })
-      .onConflict('optionId')
-      .merge();
+    if (changes.displayName !== undefined) {
+      await knex('ext_tracking_option_names')
+        .insert({ optionId, name: changes.displayName })
+        .onConflict('optionId')
+        .merge();
+    }
+    if (changes.active !== undefined) {
+      await knex('tracking_category_options')
+        .where({ id: optionId })
+        .update({ active: changes.active, updatedAt: knex.fn.now() });
+    }
 
     const category = await this.get(categoryId);
 

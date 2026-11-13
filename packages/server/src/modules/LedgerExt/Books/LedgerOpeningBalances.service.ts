@@ -5,7 +5,7 @@ import { TENANCY_DB_CONNECTION } from '@/modules/Tenancy/TenancyDB/TenancyDB.con
 import { AccountTypesUtils } from '@/modules/Accounts/utils/AccountType.utils';
 import { ExtUnitOfWork } from '../common/ExtUnitOfWork.service';
 import { fromCents, toCents } from '../common/money';
-import { toInstant } from '../common/timestamps';
+import { toPlainDate } from '../common/timestamps';
 import {
   LedgerAccountBrief,
   LedgerAccountsService,
@@ -20,7 +20,7 @@ export interface OpeningBalanceView {
   account: LedgerAccountBrief | null;
   /** In the account's own direction: a credit balance of a liability is positive. */
   amount: string;
-  postedAt: string;
+  postedOn: string;
 }
 
 /**
@@ -48,7 +48,7 @@ export class LedgerOpeningBalancesService {
   public async import(
     dto: ImportLedgerOpeningBalancesDto,
   ): Promise<OpeningBalanceView[]> {
-    const postedAt = toInstant(dto.postedAt);
+    const postedOn = toPlainDate(dto.postedOn);
     const nodes = await this.tree.list();
     const blank = (value: string | null | undefined) =>
       value === null || value === undefined || value.trim() === '';
@@ -81,8 +81,41 @@ export class LedgerOpeningBalancesService {
         );
       }
       seen.add(accountId);
-      return { accountId, cents: toCents(row.debit) - toCents(row.credit) };
+      return {
+        index,
+        accountId,
+        cents: toCents(row.debit) - toCents(row.credit),
+      };
     });
+    await this.accounts.assertPostable(rows.map((row) => row.accountId));
+    // What was owed either way when the books began comes in bill by bill
+    // and invoice by invoice, each an opening document with its own party.
+    const control = await this.tenantKnex()('accounts')
+      .whereIn(
+        'id',
+        rows.map((row) => row.accountId),
+      )
+      .whereIn('account_type', ['accounts-receivable', 'accounts-payable'])
+      .select('id', 'account_type as accountType');
+    if (control.length > 0) {
+      // The first such row as the caller sent them.
+      const types = new Map(
+        control.map((account: any) => [
+          Number(account.id),
+          account.accountType,
+        ]),
+      );
+      const row = rows.find((r) => types.has(r.accountId));
+      const what =
+        types.get(row.accountId) === 'accounts-payable'
+          ? 'the payable account: bring each open bill in as an opening bill'
+          : 'the receivable account: bring each open invoice in as an opening invoice';
+      throw new ServiceError(
+        BOOKS_ERRORS.OPENING_CONTROL_ACCOUNT_ROW,
+        `Opening balance ${row.index + 1} names ${what}.`,
+        { index: row.index, accountId: row.accountId },
+      );
+    }
 
     await this.uow.withTransaction(async (trx) => {
       // The equity account's row is locked first, so that two imports at
@@ -96,15 +129,12 @@ export class LedgerOpeningBalancesService {
           'Opening balances have been imported already. Delete them to import again.',
         );
       }
-      await this.lock.assertOpen([postedAt], trx);
+      await this.lock.assertOpen([postedOn], trx);
 
-      const shared = {
-        equityAccountId,
-        contactOf: await this.openings.controlContacts(trx),
-      };
-      for (const row of rows) {
+      const shared = { equityAccountId };
+      for (const { accountId, cents } of rows) {
         await this.openings.post(
-          { source: 'import', sourceId: null, ...row, postedAt },
+          { source: 'import', sourceId: null, accountId, cents, postedOn },
           trx,
           shared,
         );
@@ -140,7 +170,7 @@ export class LedgerOpeningBalancesService {
       return {
         account: briefs.get(row.accountId) ?? null,
         amount: fromCents(creditNormal.has(row.accountId) ? -cents : cents),
-        postedAt: row.postedAt,
+        postedOn: row.postedOn,
       };
     });
   }
@@ -155,7 +185,7 @@ export class LedgerOpeningBalancesService {
       if (rows.length === 0) return;
 
       await this.lock.assertOpen(
-        rows.map((row) => row.postedAt),
+        rows.map((row) => row.postedOn),
         trx,
       );
       await this.openings.removeAll('import', trx);

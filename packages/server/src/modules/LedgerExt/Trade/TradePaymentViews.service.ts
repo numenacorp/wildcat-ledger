@@ -8,6 +8,10 @@ import {
   LedgerAccountBrief,
   LedgerAccountsService,
 } from '../Accounts/LedgerAccounts.service';
+import {
+  ApplicationView,
+  CreditApplicationsService,
+} from './CreditApplications.service';
 import { ExtPartiesService, PartyKind, PartyView } from './ExtParties.service';
 import { ALLOCATIONS_TABLE, PAYMENTS_TABLE } from './TradeLedger.service';
 import { TradeConfig } from './trade.config';
@@ -16,10 +20,17 @@ import { TradeConfig } from './trade.config';
 export interface TradePaymentView {
   id: number;
   externalId: string | null;
-  paidAt: string;
+  /** Raised when the payment is deleted. */
+  version: number;
+  paidOn: string;
   method: string | null;
   processor: string | null;
   amount: string;
+  /**
+   * What the payment has left: its amount less its parts and what has been
+   * applied from it since. A credit with its party.
+   */
+  unapplied: string;
   /** The account the request named, or null when it named none. */
   account: LedgerAccountBrief | null;
   /** The account a redeemed credit balance was taken from, when named. */
@@ -41,6 +52,8 @@ export interface TradePaymentView {
     memo: string | null;
     amount: string;
   }>;
+  /** What was applied from the payment after it was made, oldest first. */
+  applications: ApplicationView[];
   createdAt: string | null;
 }
 
@@ -59,6 +72,7 @@ export class TradePaymentViewsService {
     private readonly metadata: ExtMetadataService,
     private readonly accounts: LedgerAccountsService,
     private readonly parties: ExtPartiesService,
+    private readonly applications: CreditApplicationsService,
   ) {}
 
   /**
@@ -74,14 +88,16 @@ export class TradePaymentViewsService {
 
     const kind = config.paymentKind;
     const knex = this.tenantKnex();
-    const [payments, allocations, externalIds, metadata] = await Promise.all([
-      knex(PAYMENTS_TABLE).where({ kind }).whereIn('id', ids),
-      knex(ALLOCATIONS_TABLE)
-        .whereIn('paymentId', ids)
-        .orderBy(['paymentId', 'index']),
-      this.externalIds.findExternalIds(kind, ids),
-      this.metadata.getMany(kind, ids),
-    ]);
+    const [payments, allocations, externalIds, metadata, applications] =
+      await Promise.all([
+        knex(PAYMENTS_TABLE).where({ kind }).whereIn('id', ids),
+        knex(ALLOCATIONS_TABLE)
+          .whereIn('paymentId', ids)
+          .orderBy(['paymentId', 'index']),
+        this.externalIds.findExternalIds(kind, ids),
+        this.metadata.getMany(kind, ids),
+        this.applications.fromSources(kind, ids),
+      ]);
     const present = (value: unknown) => value !== null && value !== undefined;
     const [briefs, parties] = await Promise.all([
       this.accounts.briefs(
@@ -101,18 +117,27 @@ export class TradePaymentViewsService {
     for (const payment of payments) {
       const id = Number(payment.id);
       const deleted = Boolean(payment.deletedAt);
+      const applied = applications.filter((a) => a.sourceId === id);
+      const used = [
+        ...allocations.filter((a: any) => Number(a.paymentId) === id),
+        ...applied,
+      ].reduce((sum, a: any) => sum + toCents(String(a.amount)), 0n);
 
       views.set(id, {
         id,
-        // A deleted payment has given its external id up; it is still shown
-        // with the one it carried.
+        // A deleted payment keeps its external id, and is shown with it.
         externalId: deleted
           ? await this.externalIds.findLastExternalId(kind, id)
           : (externalIds.get(id) ?? null),
-        paidAt: payment.paidAt,
+        version: Number(payment.version),
+        paidOn: payment.paidOn,
         method: payment.method ?? null,
         processor: payment.processor ?? null,
         amount: fromCents(toCents(String(payment.amount))),
+        // A deleted payment has nothing left to apply.
+        unapplied: fromCents(
+          deleted ? 0n : toCents(String(payment.amount)) - used,
+        ),
         account: present(payment.accountId)
           ? (briefs.get(Number(payment.accountId)) ?? null)
           : null,
@@ -140,6 +165,7 @@ export class TradePaymentViewsService {
                 memo: a.memo ?? null,
                 amount: fromCents(toCents(String(a.amount))),
               })),
+        applications: applied,
         createdAt: toIso(payment.createdAt),
       });
     }

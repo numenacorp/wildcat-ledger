@@ -1,4 +1,7 @@
 import { Knex } from 'knex';
+import { ExtRecordKind } from '../LedgerExt.constants';
+import { TRACKING_ERRORS } from './tracking.constants';
+import { ServiceError } from '@/modules/Items/ServiceError';
 import { Inject, Injectable } from '@nestjs/common';
 import { TENANCY_DB_CONNECTION } from '@/modules/Tenancy/TenancyDB/TenancyDB.constants';
 import { CreateTrackingCategoryService } from '@/modules/TrackingCategories/commands/CreateTrackingCategory.service';
@@ -31,12 +34,9 @@ export interface TrackingView {
 /**
  * Tracking categories and options addressed by name.
  *
- * A write may name a category or an option that does not exist yet; it is
- * created then. Categories and options are created before, and outside, the
- * transaction of the document that names them, because Bigcapital validates a
- * document's assignments on a connection of its own, where rows of an open
- * transaction cannot be seen. A category created for a document that then
- * fails is left in place, empty.
+ * A write names categories and options that exist and are active: one that
+ * is unknown, or archived, is refused, and nothing is made on first use.
+ * Categories and options are made through their own routes.
  */
 @Injectable()
 export class ExtTrackingService {
@@ -47,25 +47,74 @@ export class ExtTrackingService {
   ) {}
 
   /**
-   * Resolves named assignments to ids, creating what is missing.
+   * The assignments the lines of one record carry now, for `resolve`: an
+   * edit of the record may send them again though one is archived since.
+   */
+  public async carriedBy(
+    lineKind: ExtRecordKind,
+    recordId: number,
+  ): Promise<TrackingInput[]> {
+    const lines = await this.tenantKnex()('ext_lines')
+      .where({ kind: lineKind, recordId })
+      .select('id');
+    const links = await this.ofLines(lines.map((line: any) => Number(line.id)));
+
+    return [...links.values()]
+      .flat()
+      .map(({ category, option }) => ({ category, option }));
+  }
+
+  /**
+   * Resolves named assignments to ids. Nothing is created.
+   * @param carried Assignments the record being edited already carries. An
+   *   archived option stays on the lines that carry it, so it is taken
+   *   again from them; it is refused on any other line.
    * @returns For each distinct `category` and `option` pair, its ids.
+   * @throws {ServiceError} TRACKING_CATEGORY_NOT_FOUND,
+   *   TRACKING_OPTION_NOT_FOUND, TRACKING_OPTION_ARCHIVED
    */
   public async resolve(
     inputs: TrackingInput[],
+    carried: TrackingInput[] = [],
   ): Promise<Map<string, TrackingAssignment>> {
     const resolved = new Map<string, TrackingAssignment>();
+    const knex = this.tenantKnex();
+    const kept = new Set(carried.map((input) => this.key(input)));
 
     for (const input of inputs) {
       const key = this.key(input);
       if (resolved.has(key)) continue;
 
-      const categoryId = await this.ensureCategory(input.category);
-      const optionId = await this.ensureOption(
-        categoryId,
-        input.option,
-        input.optionName,
-      );
-      resolved.set(key, { categoryId, optionId });
+      const { category, option } = input;
+      const categoryRow = await knex('tracking_categories')
+        .where({ name: category })
+        .first();
+      if (!categoryRow) {
+        throw new ServiceError(
+          TRACKING_ERRORS.UNKNOWN_CATEGORY,
+          `There is no tracking category "${category}". Make it before a write names it.`,
+          { category },
+        );
+      }
+      const categoryId = Number(categoryRow.id);
+      const optionRow = await knex('tracking_category_options')
+        .where({ categoryId, name: option })
+        .first();
+      if (!optionRow) {
+        throw new ServiceError(
+          TRACKING_ERRORS.UNKNOWN_OPTION,
+          `The tracking category "${category}" has no option "${option}". Make it before a write names it.`,
+          { category, option },
+        );
+      }
+      if (!optionRow.active && !kept.has(key)) {
+        throw new ServiceError(
+          TRACKING_ERRORS.OPTION_ARCHIVED,
+          `The option "${option}" of the tracking category "${category}" is archived and takes no new line.`,
+          { category, option },
+        );
+      }
+      resolved.set(key, { categoryId, optionId: Number(optionRow.id) });
     }
     return resolved;
   }

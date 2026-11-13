@@ -3,11 +3,11 @@ import {
   IsArray,
   IsIn,
   IsInt,
-  IsISO8601,
   IsNotEmpty,
   IsObject,
   IsOptional,
   IsString,
+  Min,
   MaxLength,
   ValidateIf,
 } from 'class-validator';
@@ -86,6 +86,15 @@ export class CreateLedgerChildAccountDto {
 
 @StrictDto()
 export class EditLedgerAccountDto {
+  @ApiProperty({
+    required: false,
+    description: 'The version of the account the change was made from',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+
   @ApiProperty({ required: false })
   @IsOptional()
   @IsString()
@@ -123,19 +132,19 @@ export class EditLedgerAccountDto {
 @StrictDto()
 export class ListLedgerAccountsQueryDto {
   @ApiProperty({
-    description: 'Start of the balance range, inclusive',
+    description: 'First day of the balance range, a plain date',
     required: false,
   })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   from?: string;
 
   @ApiProperty({
-    description: 'End of the balance range, exclusive',
+    description: 'Last day of the balance range, a plain date',
     required: false,
   })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   to?: string;
 
   @ApiProperty({ enum: ['accrual', 'cash'], required: false })
@@ -195,6 +204,21 @@ export class LedgerAccountResponseDto {
   @ApiProperty({ nullable: true })
   parentId: number | null;
 
+  @ApiProperty({
+    description:
+      'A heading of one of the five root types: it groups accounts and takes no postings',
+  })
+  isTypeRoot: boolean;
+
+  @ApiProperty({ description: 'Raised by every change to the account' })
+  version: number;
+
+  @ApiProperty({
+    description:
+      'False once archived: the account takes no new line and still reports',
+  })
+  active: boolean;
+
   @ApiProperty({ nullable: true })
   externalId: string | null;
 
@@ -223,4 +247,11 @@ export class LedgerAccountResponseDto {
     required: false,
   })
   ownOpeningBalance?: string;
+
+  @ApiProperty({
+    description:
+      'On an income or expense account, when `to` is sent: debits less credits, with descendants, of everything before the fiscal year `to` falls in',
+    required: false,
+  })
+  priorYearsBalance?: string;
 }

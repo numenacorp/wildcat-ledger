@@ -8,9 +8,20 @@ export const MARKED_ACCOUNTS: Record<string, string> = {
   'payments-out-clearing': 'liability',
   /** Money an invoice payment brings in with no receiving account named. */
   'payments-in-clearing': 'asset',
-  /** What a bill payment pays beyond the bills it names. */
+  /**
+   * Money paid to a vendor and not yet applied to a bill, on the cash basis
+   * only. A chart that does not mark it uses `uncategorized-expense`.
+   */
+  'unapplied-cash-expense': 'expense',
+  /**
+   * Money received from a customer and not yet applied to an invoice, on the
+   * cash basis only. A chart that does not mark it uses
+   * `uncategorized-income`.
+   */
+  'unapplied-cash-income': 'income',
+  /** Stands in for `unapplied-cash-expense` where a chart does not mark it. */
   'uncategorized-expense': 'expense',
-  /** What an invoice payment brings in beyond the invoices it names. */
+  /** Stands in for `unapplied-cash-income` where a chart does not mark it. */
   'uncategorized-income': 'income',
   /** A credit balance redeemed against an invoice with no account named. */
   'unearned-revenue': 'liability',

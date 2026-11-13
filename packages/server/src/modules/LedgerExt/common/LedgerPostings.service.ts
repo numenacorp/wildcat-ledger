@@ -9,10 +9,7 @@ import { inChunks } from './chunks';
 import { isOutOfRange } from './dbErrors';
 import { ServiceError } from '@/modules/Items/ServiceError';
 import { centsToNumber, fromCents } from './money';
-import { toLocalDay } from './timestamps';
 import { LedgerRowsService } from './LedgerRows.service';
-
-const INSTANTS_TABLE = 'ext_row_instants';
 
 /**
  * The largest amount one ledger row holds, in cents: Bigcapital keeps debits
@@ -29,8 +26,8 @@ export interface Posting {
   accountId: number;
   /** Whole cents: positive for a debit, negative for a credit. */
   cents: bigint;
-  /** The exact instant the row is dated at. */
-  postedAt: string;
+  /** The day the row is dated, a plain date. */
+  postedOn: string;
   /** The basis the row counts on; null counts on both. */
   basis: 'accrual' | 'cash' | null;
   /** The vendor or customer, on a payable or receivable row. */
@@ -45,8 +42,6 @@ export interface PostingContext {
   /** Bigcapital's name for the kind of document, such as `Bill`. */
   referenceType: string;
   referenceId: number;
-  /** The organization's time zone: a row's calendar day is the day there. */
-  timezone: string;
   currencyCode: string;
   number?: string | null;
   reference?: string | null;
@@ -54,8 +49,8 @@ export interface PostingContext {
 
 /**
  * Writes the ledger rows of the extension's own documents through
- * Bigcapital's ledger, so that account and contact balances follow, and keeps
- * the exact instant of each row.
+ * Bigcapital's ledger, so that account and contact balances follow. Each row
+ * is dated its own day: a document may post rows on more than one.
  */
 @Injectable()
 export class LedgerPostingsService {
@@ -111,7 +106,7 @@ export class LedgerPostingsService {
         accountId: posting.accountId,
         accountNormal: normalOf.get(posting.accountId),
         contactId: posting.contactId ?? undefined,
-        date: toLocalDay(posting.postedAt, context.timezone),
+        date: posting.postedOn,
         transactionType: context.referenceType,
         transactionId: context.referenceId,
         transactionNumber: context.number ?? undefined,
@@ -142,19 +137,6 @@ export class LedgerPostingsService {
       );
     }
 
-    const rows = await trx('accounts_transactions')
-      .where({
-        referenceType: context.referenceType,
-        referenceId: context.referenceId,
-      })
-      .select('id', 'index');
-
-    await trx(INSTANTS_TABLE).insert(
-      rows.map((row: any) => ({
-        accountTransactionId: Number(row.id),
-        postedAt: live[Number(row.index) - 1].postedAt,
-      })),
-    );
     await this.ledgerRows.rememberPosted(accountIds, trx);
   }
 
@@ -175,12 +157,6 @@ export class LedgerPostingsService {
     const storage = await this.locator.resolve(LedgerStorageService);
 
     await storage.deleteByReference(referenceId, referenceType, trx);
-    await inChunks(rowIds, (run) =>
-      trx(INSTANTS_TABLE)
-        .whereIn('accountTransactionId', run)
-        .delete()
-        .then(() => []),
-    );
     await inChunks(rowIds, (run) =>
       trx('account_transaction_tracking_categories')
         .whereIn('accountTransactionId', run)

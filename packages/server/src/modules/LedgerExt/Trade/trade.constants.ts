@@ -11,12 +11,17 @@ export const TRADE_ERRORS = {
   VENDOR_NOT_FOUND: 'vendor_not_found',
   BILL_NOT_FOUND: 'bill_not_found',
   BILL_PAYMENT_NOT_FOUND: 'bill_payment_not_found',
-  /** An edit would leave a bill totalling less than has been paid on it. */
-  BILL_AMOUNT_BELOW_PAID: 'BILL_AMOUNT_BELOW_PAID',
+  /**
+   * An edit would change the day, the vendor or the lines' accounts or
+   * amounts of a bill with something paid on it or applied to it.
+   */
+  BILL_EDIT_HAS_PAYMENTS: 'BILL_EDIT_HAS_PAYMENTS',
   /** A payment would pay more of a bill than it still owes. */
   BILL_ALLOCATION_EXCEEDS_BALANCE: 'BILL_ALLOCATION_EXCEEDS_BALANCE',
   /** A bill with a payment on it cannot be voided. */
   BILL_HAS_PAYMENTS: 'BILL_HAS_PAYMENTS',
+  /** A voided bill can be neither edited nor paid. */
+  BILL_VOIDED: 'BILL_VOIDED',
   /** A payment's amount is less than the sum of what it allocates. */
   PAYMENT_AMOUNT_BELOW_ALLOCATIONS: 'PAYMENT_AMOUNT_BELOW_ALLOCATIONS',
   /** A payment allocates to a bill that does not exist. */
@@ -27,8 +32,8 @@ export const TRADE_ERRORS = {
   CUSTOMER_NOT_FOUND: 'customer_not_found',
   INVOICE_NOT_FOUND: 'invoice_not_found',
   INVOICE_PAYMENT_NOT_FOUND: 'invoice_payment_not_found',
-  /** An edit would leave an invoice totalling less than has been paid on it. */
-  INVOICE_AMOUNT_BELOW_PAID: 'INVOICE_AMOUNT_BELOW_PAID',
+  /** The same, for an invoice. */
+  INVOICE_EDIT_HAS_PAYMENTS: 'INVOICE_EDIT_HAS_PAYMENTS',
   /** A payment would pay more of an invoice than it is still owed. */
   INVOICE_ALLOCATION_EXCEEDS_BALANCE: 'INVOICE_ALLOCATION_EXCEEDS_BALANCE',
   /** An invoice with a payment on it cannot be voided. */
@@ -43,6 +48,48 @@ export const TRADE_ERRORS = {
   PAYMENT_INVOICE_OF_ANOTHER_CUSTOMER: 'PAYMENT_INVOICE_OF_ANOTHER_CUSTOMER',
   /** Both a customer id and a customer external id, or neither, were given. */
   CUSTOMER_REQUIRED: 'CUSTOMER_REQUIRED',
+
+  /** An edit would leave a bill totalling less than zero. */
+  BILL_AMOUNT_NEGATIVE: 'BILL_AMOUNT_NEGATIVE',
+
+  VENDOR_CREDIT_NOT_FOUND: 'vendor_credit_not_found',
+  /** The same, for a vendor credit with something applied from it. */
+  VENDOR_CREDIT_EDIT_HAS_APPLICATIONS: 'VENDOR_CREDIT_EDIT_HAS_APPLICATIONS',
+  /** A vendor credit with an application cannot be voided. */
+  VENDOR_CREDIT_HAS_APPLICATIONS: 'VENDOR_CREDIT_HAS_APPLICATIONS',
+  /** A voided vendor credit can be neither edited nor applied. */
+  VENDOR_CREDIT_VOIDED: 'VENDOR_CREDIT_VOIDED',
+  /** A vendor credit is entered as a positive amount. */
+  VENDOR_CREDIT_AMOUNT_NEGATIVE: 'VENDOR_CREDIT_AMOUNT_NEGATIVE',
+
+  CREDIT_NOTE_NOT_FOUND: 'credit_note_not_found',
+  /** The same, for a credit note with something applied from it. */
+  CREDIT_NOTE_EDIT_HAS_APPLICATIONS: 'CREDIT_NOTE_EDIT_HAS_APPLICATIONS',
+  /** A credit note with an application cannot be voided. */
+  CREDIT_NOTE_HAS_APPLICATIONS: 'CREDIT_NOTE_HAS_APPLICATIONS',
+  /** A voided credit note can be neither edited nor applied. */
+  CREDIT_NOTE_VOIDED: 'CREDIT_NOTE_VOIDED',
+  /** A credit note is entered as a positive amount. */
+  CREDIT_NOTE_AMOUNT_NEGATIVE: 'CREDIT_NOTE_AMOUNT_NEGATIVE',
+
+  /**
+   * An opening document is dated after the day the books start, or the
+   * books have no start.
+   */
+  OPENING_DOCUMENT_AFTER_START: 'OPENING_DOCUMENT_AFTER_START',
+  /**
+   * A document that is not an opening one is dated on or before the day the
+   * books start.
+   */
+  DOCUMENT_BEFORE_BOOKS_START: 'DOCUMENT_BEFORE_BOOKS_START',
+
+  CREDIT_APPLICATION_NOT_FOUND: 'credit_application_not_found',
+  /** An application is of more than its payment or credit has left. */
+  APPLICATION_EXCEEDS_UNAPPLIED: 'APPLICATION_EXCEEDS_UNAPPLIED',
+  /** An application is to a document of another vendor or customer. */
+  APPLICATION_OF_ANOTHER_PARTY: 'APPLICATION_OF_ANOTHER_PARTY',
+  /** An application is of an amount above zero. */
+  APPLICATION_AMOUNT_NOT_POSITIVE: 'APPLICATION_AMOUNT_NOT_POSITIVE',
 };
 
 /** The most lines one bill may hold. */
@@ -55,6 +102,14 @@ export const PAYMENT_MAX_ALLOCATIONS = 1000;
 export const DOCUMENT_LIST_MAX_PAGE_SIZE = 50000;
 
 export type DocumentStatus = 'open' | 'partially_paid' | 'paid' | 'voided';
+
+/** The statuses of a credit, against those of a document: what is paid on a document is applied from a credit. */
+export const CREDIT_STATUSES: Record<DocumentStatus, string> = {
+  open: 'open',
+  partially_paid: 'partially_applied',
+  paid: 'applied',
+  voided: 'voided',
+};
 
 /**
  * The status of a bill: voided once voided, whatever is paid; otherwise paid

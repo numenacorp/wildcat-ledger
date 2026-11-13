@@ -75,18 +75,20 @@ export class LedgerTrackingCategoriesController {
   }
 
   @Put(':id/options/:optionId')
-  @ApiOperation({ summary: 'Change the name an option is shown under' })
-  async renameOption(
+  @ApiOperation({
+    summary:
+      'Change the name an option is shown under, or archive or restore it',
+  })
+  async updateOption(
     @Param('id') id: string,
     @Param('optionId') optionId: string,
     @Body() dto: RenameLedgerTrackingOptionDto,
   ) {
     return {
-      data: await this.categories.renameOption(
-        Number(id),
-        Number(optionId),
-        dto.displayName,
-      ),
+      data: await this.categories.updateOption(Number(id), Number(optionId), {
+        displayName: dto.displayName,
+        active: dto.active,
+      }),
     };
   }
 }

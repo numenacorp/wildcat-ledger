@@ -4,11 +4,11 @@ import {
   ArrayMinSize,
   IsArray,
   IsInt,
-  IsISO8601,
   IsNotEmpty,
   IsObject,
   IsOptional,
   IsString,
+  Min,
   Matches,
   MaxLength,
   ValidateIf,
@@ -43,7 +43,7 @@ export class LedgerTrackingDto {
 
   @ApiProperty({
     description:
-      'The name the option is shown under; taken when the option is new',
+      'Not used: an option is named through its own route, and none is made by a write',
     required: false,
   })
   @ValidateIf((dto) => dto.optionName !== null && dto.optionName !== undefined)
@@ -84,6 +84,52 @@ export class LedgerManualJournalEntryDto {
   @MaxLength(EXTERNAL_ID_MAX_LENGTH)
   externalId?: string;
 
+  @ApiProperty({
+    description:
+      'The customer the line is about. Required on a line to the receivable account.',
+    required: false,
+  })
+  @ValidateIf((dto) => dto.customerId !== null && dto.customerId !== undefined)
+  @IsInt()
+  customerId?: number | null;
+
+  @ApiProperty({
+    description:
+      'The vendor the line is about. Required on a line to the payable account.',
+    required: false,
+  })
+  @ValidateIf((dto) => dto.vendorId !== null && dto.vendorId !== undefined)
+  @IsInt()
+  vendorId?: number | null;
+
+  @ApiProperty({
+    description:
+      "The customer, by the caller's own id of it, in place of customerId. The customer must exist.",
+    required: false,
+  })
+  @ValidateIf(
+    (dto) =>
+      dto.customerExternalId !== null && dto.customerExternalId !== undefined,
+  )
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(EXTERNAL_ID_MAX_LENGTH)
+  customerExternalId?: string | null;
+
+  @ApiProperty({
+    description:
+      "The vendor, by the caller's own id of it, in place of vendorId. A vendor not seen before is made, with no name, as a bill makes one.",
+    required: false,
+  })
+  @ValidateIf(
+    (dto) =>
+      dto.vendorExternalId !== null && dto.vendorExternalId !== undefined,
+  )
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(EXTERNAL_ID_MAX_LENGTH)
+  vendorExternalId?: string | null;
+
   @ApiProperty({ type: [LedgerTrackingDto], required: false })
   @IsOptional()
   @IsArray()
@@ -94,6 +140,16 @@ export class LedgerManualJournalEntryDto {
 
 @StrictDto()
 export class LedgerManualJournalDto {
+  @ApiProperty({
+    required: false,
+    description:
+      'On an edit: the version of the journal the edit was made from',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+
   @ApiProperty({ required: false })
   @ValidateIf((dto) => dto.externalId !== null && dto.externalId !== undefined)
   @IsString()
@@ -104,8 +160,8 @@ export class LedgerManualJournalDto {
   @ApiProperty({
     description: 'The instant of the journal, as an ISO-8601 timestamp',
   })
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @IsString()
+  postedOn: string;
 
   @ApiProperty({ required: false })
   @IsOptional()
@@ -157,12 +213,12 @@ export class BulkLedgerManualJournalsDto {
 export class ListLedgerManualJournalsQueryDto {
   @ApiProperty({ description: 'Earliest instant, inclusive', required: false })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   from?: string;
 
   @ApiProperty({ description: 'Latest instant, inclusive', required: false })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   to?: string;
 
   @ApiProperty({ description: 'Comma-separated external ids', required: false })

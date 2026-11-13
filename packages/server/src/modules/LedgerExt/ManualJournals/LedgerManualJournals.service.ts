@@ -6,17 +6,22 @@ import { CreateManualJournalService } from '@/modules/ManualJournals/commands/Cr
 import { EditManualJournal } from '@/modules/ManualJournals/commands/EditManualJournal.service';
 import { DeleteManualJournalService } from '@/modules/ManualJournals/commands/DeleteManualJournal.service';
 import { ERRORS as JOURNAL_ERRORS } from '@/modules/ManualJournals/constants';
+import { ExtAuditService } from '../common/ExtAudit.service';
 import { ExtUnitOfWork } from '../common/ExtUnitOfWork.service';
 import { ExternalIdsService } from '../common/ExternalIds.service';
 import { ExtMetadataService } from '../common/ExtMetadata.service';
 import { ExtDocumentsService } from '../common/ExtDocuments.service';
 import { ExtLinesService } from '../common/ExtLines.service';
-import { ExtSettingsService } from '../common/ExtSettings.service';
 import { ExtSequencesService } from '../common/ExtSequences.service';
 import { ExtServiceLocator } from '../common/ExtServiceLocator.service';
 import { LedgerRowsService } from '../common/LedgerRows.service';
 import { fromThousandths, toThousandths } from '../common/decimal';
-import { toInstant, toLocalDay } from '../common/timestamps';
+import { toPlainDate } from '../common/timestamps';
+import {
+  raiseVersion,
+  refusingStale,
+  requireVersion,
+} from '../common/versions';
 import { ERRORS, ExtRecordKind } from '../LedgerExt.constants';
 import { ExtAccountTreeService } from '../Accounts/ExtAccountTree.service';
 import { ACCOUNT_ERRORS } from '../Accounts/LedgerAccounts.constants';
@@ -25,7 +30,8 @@ import {
   ExtTrackingService,
   TrackingAssignment,
 } from '../Tracking/ExtTracking.service';
-import { WORKSPACE_SETTINGS } from '../Workspaces/LedgerWorkspaces.constants';
+import { LedgerAccountsService } from '../Accounts/LedgerAccounts.service';
+import { ExtPartiesService } from '../Trade/ExtParties.service';
 import {
   LedgerManualJournalDto,
   ListLedgerManualJournalsQueryDto,
@@ -33,11 +39,23 @@ import {
 
 const SEQUENCE = 'manual_journal';
 
+/** Journals written in a transaction, each with the id of its audit row. */
+type Logged = Array<[journalId: number, auditId: number]>;
+
+export const LEDGER_JOURNAL_ERRORS = {
+  /** A line to the receivable account names no customer, or one to the payable account no vendor. */
+  JOURNAL_LINE_PARTY_REQUIRED: 'JOURNAL_LINE_PARTY_REQUIRED',
+  /** A line names both a customer and a vendor. */
+  JOURNAL_LINE_NAMES_ONE_PARTY: 'JOURNAL_LINE_NAMES_ONE_PARTY',
+};
+
 export interface LedgerManualJournalView {
   id: number;
   externalId: string | null;
+  /** Raised by every edit of the journal. */
+  version: number;
   journalNumber: string;
-  postedAt: string;
+  postedOn: string;
   description: string | null;
   reference: string | null;
   createdBy: string | null;
@@ -50,6 +68,11 @@ export interface LedgerManualJournalView {
     debit: string;
     credit: string;
     note: string | null;
+    /** The customer or the vendor the line names; one at most. */
+    customerId: number | null;
+    customerExternalId: string | null;
+    vendorId: number | null;
+    vendorExternalId: string | null;
     tracking: Array<{
       id: number;
       category: string;
@@ -62,7 +85,7 @@ export interface LedgerManualJournalView {
 /** What a journal needs resolved before its transaction opens. */
 interface PreparedJournal {
   dto: LedgerManualJournalDto;
-  postedAt: string;
+  postedOn: string;
   date: string;
   entries: Array<{
     index: number;
@@ -90,78 +113,99 @@ export class LedgerManualJournalsService {
     private readonly metadata: ExtMetadataService,
     private readonly documents: ExtDocumentsService,
     private readonly lines: ExtLinesService,
-    private readonly settings: ExtSettingsService,
     private readonly sequences: ExtSequencesService,
     private readonly tree: ExtAccountTreeService,
     private readonly tracking: ExtTrackingService,
     private readonly lock: ExtLockService,
     private readonly locator: ExtServiceLocator,
     private readonly ledgerRows: LedgerRowsService,
+    private readonly accounts: LedgerAccountsService,
+    private readonly parties: ExtPartiesService,
+    private readonly audit: ExtAuditService,
   ) {}
 
   /**
-   * Creates a journal. A create carrying the external id of an existing
-   * journal replaces that journal with the one given, and one carrying the
-   * external id of a deleted journal brings it back under its old id.
+   * Adds to the audit rows of journals just written what each journal
+   * became, once their transaction has committed.
    */
-  public async create(
-    dto: LedgerManualJournalDto,
-  ): Promise<{ journal: LedgerManualJournalView; created: boolean }> {
+  private async finishAudit(logged: Logged): Promise<void> {
+    if (logged.length === 0) return;
+    const views = await this.views(logged.map(([journalId]) => journalId));
+
+    for (const [journalId, auditId] of logged) {
+      await this.audit.finish(auditId, views.get(journalId) ?? null);
+    }
+  }
+
+  /** What the journal holding an external id is now, for a conflict's answer. */
+  private describe = async (journalId: number) => ({
+    state: 'live' as const,
+    version:
+      (await this.documents.get(ExtRecordKind.ManualJournal, journalId))
+        ?.version ?? 1,
+  });
+
+  /**
+   * Creates a journal. A create carrying the external id of an existing
+   * journal is a retry when its body is the one the journal was made with,
+   * and is answered with the journal; otherwise, and for the id of a deleted
+   * journal, it is refused.
+   * @throws {ServiceError} EXTERNAL_ID_IN_USE
+   */
+  public async create(dto: LedgerManualJournalDto): Promise<{
+    journal: LedgerManualJournalView;
+    created: boolean;
+    replayed: boolean;
+  }> {
     const kind = ExtRecordKind.ManualJournal;
+    const { version: _version, ...body } = dto;
 
     if (dto.externalId) {
-      const existingId = await this.externalIds.findRecordId(
-        kind,
-        dto.externalId,
-      );
-      if (existingId !== null) {
-        return { journal: await this.edit(existingId, dto), created: false };
-      }
-      const deletedId = await this.externalIds.findDeletedRecordId(
-        kind,
-        dto.externalId,
-      );
-      if (deletedId !== null) {
-        const [revived] = await this.prepare([dto]);
-        const revivedNumber = await this.sequences.next(SEQUENCE);
-        const broughtBack = await this.uow.withTransaction(async (trx) => {
-          if (!(await this.externalIds.revive(kind, dto.externalId, trx))) {
-            return false;
-          }
-          await this.createInTransaction(
-            revived,
-            revivedNumber,
-            trx,
-            deletedId,
-          );
-          return true;
-        });
-        // Another request brought it back first: this one replaces it.
-        if (!broughtBack) return this.create(dto);
+      // A repeat is answered before anything about the body is checked: a
+      // retry must not fail on what has changed since, a lock above all.
+      const held = await this.externalIds.findRecordId(kind, dto.externalId);
 
-        return { journal: await this.get(deletedId), created: false };
+      if (held !== null) {
+        await this.externalIds.createOnce({
+          kind,
+          externalId: dto.externalId,
+          body,
+          describe: this.describe,
+          create: async () => held,
+          read: async (id) => id,
+        });
+        return {
+          journal: await this.get(held),
+          created: false,
+          replayed: true,
+        };
       }
     }
     const [prepared] = await this.prepare([dto]);
     const number = await this.sequences.next(SEQUENCE);
 
-    const { recordId, created } = await this.externalIds.createOnce({
+    const logged: Logged = [];
+    const { recordId, created, replayed } = await this.externalIds.createOnce({
       kind,
       externalId: dto.externalId,
-      create: (trx) => this.createInTransaction(prepared, number, trx),
+      body,
+      describe: this.describe,
+      create: (trx) => {
+        logged.length = 0;
+        return this.createInTransaction(prepared, number, trx, logged);
+      },
       read: async (id) => id,
     });
-    // Lost to a simultaneous create of the same external id: replace it.
-    if (!created) {
-      return { journal: await this.edit(recordId, dto), created: false };
-    }
-    return { journal: await this.get(recordId), created };
+    // When lost to a simultaneous create of the same id and body, nothing was written.
+    if (created) await this.finishAudit(logged);
+    return { journal: await this.get(recordId), created, replayed };
   }
 
   /**
    * Creates several journals in one transaction: all of them, or none. A
-   * journal whose external id already exists replaces that journal, as on a
-   * single create.
+   * journal whose external id already exists is answered as on a single
+   * create: with the journal when the body is the same, and otherwise with a
+   * refusal, which refuses the whole request.
    */
   public async createBulk(
     dtos: LedgerManualJournalDto[],
@@ -180,46 +224,54 @@ export class LedgerManualJournalsService {
       }
       seen.add(dto.externalId);
     });
-    const prepared = await this.prepare(dtos);
-    const firstNumber = await this.sequences.next(SEQUENCE, prepared.length);
+    // A repeat is answered before anything about its body is checked, as on
+    // a single create: a retry must not fail on what has changed since, a
+    // lock above all. A repeat with another body refuses the whole request.
+    const heldIds = new Map<number, number>();
+    for (let i = 0; i < dtos.length; i += 1) {
+      const { version: _version, ...body } = dtos[i];
+      if (!body.externalId) continue;
 
-    const ids = await this.uow.withTransaction(async (trx) => {
+      const held = await this.externalIds.findRecordId(kind, body.externalId);
+      if (held === null) continue;
+
+      await this.externalIds.createOnce({
+        kind,
+        externalId: body.externalId,
+        body,
+        describe: this.describe,
+        create: async () => held,
+        read: async (id) => id,
+      });
+      heldIds.set(i, held);
+    }
+    const fresh = dtos
+      .map((dto, i) => ({ dto, i }))
+      .filter(({ i }) => !heldIds.has(i));
+    const prepared = await this.prepare(fresh.map(({ dto }) => dto));
+    const firstNumber =
+      prepared.length > 0
+        ? await this.sequences.next(SEQUENCE, prepared.length)
+        : 0;
+
+    const logged: Logged = [];
+    const madeIds = await this.uow.withTransaction(async (trx) => {
       const written: number[] = [];
+      // The work may run again after a deadlock: its log starts over with it.
+      logged.length = 0;
 
       for (let i = 0; i < prepared.length; i += 1) {
         const { externalId } = prepared[i].dto;
         const number = firstNumber + i;
 
-        if (externalId) {
-          const existingId = await this.externalIds.findRecordId(
-            kind,
-            externalId,
-            trx,
-          );
-          if (existingId !== null) {
-            await this.editInTransaction(existingId, prepared[i], trx);
-            written.push(existingId);
-            continue;
-          }
-          const deletedId = await this.externalIds.findDeletedRecordId(
-            kind,
-            externalId,
-            trx,
-          );
-          if (
-            deletedId !== null &&
-            (await this.externalIds.revive(kind, externalId, trx))
-          ) {
-            await this.createInTransaction(prepared[i], number, trx, deletedId);
-            written.push(deletedId);
-            continue;
-          }
-        }
+        const { version: _version, ...body } = prepared[i].dto;
         const { recordId } = await this.externalIds.createOnce({
           kind,
           externalId,
+          body,
+          describe: this.describe,
           create: (innerTrx) =>
-            this.createInTransaction(prepared[i], number, innerTrx),
+            this.createInTransaction(prepared[i], number, innerTrx, logged),
           read: async (id) => id,
           trx,
         });
@@ -227,6 +279,13 @@ export class LedgerManualJournalsService {
       }
       return written;
     });
+    await this.finishAudit(logged);
+    // Each journal in the place it was sent in.
+    const ids = dtos.map((_dto, i) =>
+      heldIds.has(i)
+        ? heldIds.get(i)
+        : madeIds[fresh.findIndex((entry) => entry.i === i)],
+    );
     const views = await this.views(ids);
     return ids.map((id) => views.get(id));
   }
@@ -240,11 +299,31 @@ export class LedgerManualJournalsService {
     dto: LedgerManualJournalDto,
   ): Promise<LedgerManualJournalView> {
     await this.rowOrThrow(journalId);
-    const [prepared] = await this.prepare([dto]);
-
-    await this.uow.withTransaction((trx) =>
-      this.editInTransaction(journalId, prepared, trx),
+    const version = requireVersion(dto.version);
+    const [prepared] = await this.prepare(
+      [dto],
+      await this.tracking.carriedBy(
+        ExtRecordKind.ManualJournalEntry,
+        journalId,
+      ),
     );
+
+    const logged: Logged = [];
+    await refusingStale(
+      () =>
+        this.uow.withTransaction((trx) => {
+          logged.length = 0;
+          return this.editInTransaction(
+            journalId,
+            prepared,
+            trx,
+            version,
+            logged,
+          );
+        }),
+      () => this.get(journalId),
+    );
+    await this.finishAudit(logged);
     return this.get(journalId);
   }
 
@@ -252,16 +331,21 @@ export class LedgerManualJournalsService {
     journalId: number,
     prepared: PreparedJournal,
     trx: Knex.Transaction,
+    version: number,
+    logged?: Logged,
   ): Promise<void> {
     const kind = ExtRecordKind.ManualJournal;
     const { dto } = prepared;
     const old = await this.rowOrThrow(journalId, trx);
+    await this.raise(journalId, version, trx);
     const oldDocument = await this.documents.get(kind, journalId, trx);
+    // Read outside the transaction, so as it stood before this edit.
+    const before = (await this.views([journalId])).get(journalId) ?? null;
 
     // The journal as it stands must be open too: an edit cannot move a
     // journal out of the closed period.
     await this.lock.assertOpen(
-      [oldDocument?.transactedAt, prepared.postedAt],
+      [oldDocument?.transactedOn, prepared.postedOn],
       trx,
     );
 
@@ -278,62 +362,140 @@ export class LedgerManualJournalsService {
         journalId,
         trx,
       );
-      if (current !== (dto.externalId ?? null)) {
-        await this.externalIds.release(kind, journalId, trx);
-        if (dto.externalId) {
-          await this.externalIds.attach(kind, journalId, dto.externalId, trx);
-        }
+      // An external id is the journal's for ever: an edit may give one to
+      // a journal that has none, and may not change or remove one.
+      if (current === null && dto.externalId) {
+        await this.externalIds.attach(kind, journalId, dto.externalId, trx);
+      } else if (current !== null && current !== (dto.externalId ?? null)) {
+        throw new ServiceError(
+          ERRORS.EXTERNAL_ID_FIXED,
+          'The external id of a record cannot be changed or removed.',
+          { externalId: current },
+        );
       }
     }
+    // The body the journal now holds is the one a repeat of its external id
+    // is a retry of.
+    const { version: _version, ...held } = dto;
+    await this.externalIds.rehash(
+      kind,
+      journalId,
+      (externalId) => ({ ...held, externalId }),
+      trx,
+    );
     await this.writeCompanions(journalId, prepared, trx, {
       keepLineIds: true,
     });
+    const auditId = await this.audit.record(
+      {
+        action: 'edit',
+        subject: kind,
+        subjectId: journalId,
+        number: old.journalNumber ?? null,
+        before,
+      },
+      trx,
+    );
+    logged?.push([journalId, auditId]);
   }
 
   /**
-   * Deletes a journal. Its external id stays held, so that a create carrying
-   * it brings the journal back under the same id.
+   * Checks the version an edit or a delete names against the journal's, and
+   * raises it. A journal Bigcapital made has no row of the extension's yet:
+   * one is made for it, at version 1.
    */
-  public async delete(journalId: number): Promise<void> {
+  private async raise(
+    journalId: number,
+    version: number,
+    trx: Knex.Transaction,
+  ): Promise<void> {
+    const kind = ExtRecordKind.ManualJournal;
+
+    await this.documents.upsert(kind, journalId, {}, trx);
+    await raiseVersion(
+      trx,
+      'ext_documents',
+      { kind, recordId: journalId },
+      version,
+    );
+  }
+
+  /**
+   * Deletes a journal. Its external id stays its own: it is not used again.
+   */
+  public async delete(
+    journalId: number,
+    expected?: number | string | null,
+  ): Promise<void> {
     await this.rowOrThrow(journalId);
+    const version = requireVersion(expected);
     const document = await this.documents.get(
       ExtRecordKind.ManualJournal,
       journalId,
     );
-    await this.lock.assertOpen([document?.transactedAt]);
+    await this.lock.assertOpen([document?.transactedOn]);
+    // The journal as it stood, kept by the log: once deleted it is read no more.
+    const before = (await this.views([journalId])).get(journalId) ?? null;
 
     const deleteJournal = await this.locator.resolve(
       DeleteManualJournalService,
     );
 
-    await this.uow.withTransaction(async (trx) => {
-      await this.rowOrThrow(journalId, trx);
-      // Checked again where the closing instant can no longer change.
-      await this.lock.assertOpen([document?.transactedAt], trx);
-      const lines = await this.lines.list(
-        ExtRecordKind.ManualJournalEntry,
-        journalId,
-        trx,
-      );
-      await deleteJournal.deleteManualJournal(journalId, trx);
-      await this.externalIds.markDeleted(
-        ExtRecordKind.ManualJournal,
-        journalId,
-        trx,
-      );
-      await this.documents.remove(ExtRecordKind.ManualJournal, journalId, trx);
-      await this.metadata.remove(ExtRecordKind.ManualJournal, journalId, trx);
-      await this.metadata.remove(
-        ExtRecordKind.ManualJournalEntry,
-        lines.map((line) => line.id),
-        trx,
-      );
-      await this.tracking.removeLineLinks(
-        lines.map((line) => line.id),
-        trx,
-      );
-      await this.lines.remove(ExtRecordKind.ManualJournalEntry, journalId, trx);
-    });
+    await refusingStale(
+      () =>
+        this.uow.withTransaction(async (trx) => {
+          await this.rowOrThrow(journalId, trx);
+          await this.raise(journalId, version, trx);
+          // Checked again where the closing instant can no longer change.
+          await this.lock.assertOpen([document?.transactedOn], trx);
+          const lines = await this.lines.list(
+            ExtRecordKind.ManualJournalEntry,
+            journalId,
+            trx,
+          );
+          await deleteJournal.deleteManualJournal(journalId, trx);
+          await this.externalIds.markDeleted(
+            ExtRecordKind.ManualJournal,
+            journalId,
+            trx,
+          );
+          await this.documents.remove(
+            ExtRecordKind.ManualJournal,
+            journalId,
+            trx,
+          );
+          await this.metadata.remove(
+            ExtRecordKind.ManualJournal,
+            journalId,
+            trx,
+          );
+          await this.metadata.remove(
+            ExtRecordKind.ManualJournalEntry,
+            lines.map((line) => line.id),
+            trx,
+          );
+          await this.tracking.removeLineLinks(
+            lines.map((line) => line.id),
+            trx,
+          );
+          await this.lines.remove(
+            ExtRecordKind.ManualJournalEntry,
+            journalId,
+            trx,
+          );
+          await this.audit.record(
+            {
+              action: 'delete',
+              subject: ExtRecordKind.ManualJournal,
+              subjectId: journalId,
+              number: before?.journalNumber ?? null,
+              before,
+            },
+            trx,
+          );
+        }),
+      () => this.get(journalId),
+    );
   }
 
   public async get(journalId: number): Promise<LedgerManualJournalView> {
@@ -364,8 +526,9 @@ export class LedgerManualJournalsService {
         },
       );
       if (query.from)
-        builder.where('d.transacted_at', '>=', toInstant(query.from));
-      if (query.to) builder.where('d.transacted_at', '<=', toInstant(query.to));
+        builder.where('d.transacted_on', '>=', toPlainDate(query.from));
+      if (query.to)
+        builder.where('d.transacted_on', '<=', toPlainDate(query.to));
       if (query.externalIds !== undefined) {
         const externalIds = query.externalIds
           .split(',')
@@ -425,6 +588,29 @@ export class LedgerManualJournalsService {
       [...lines.values()].flatMap((list) => list.map((line) => line.id)),
     );
     const nodeById = new Map(nodes.map((node) => [node.accountId, node]));
+    // The placeholder contact of an older journal is no party, and shows
+    // as none.
+    const contactIds = [
+      ...new Set(
+        entries
+          .map((entry: any) => entry.contactId)
+          .filter((id: unknown) => id !== null && id !== undefined)
+          .map(Number),
+      ),
+    ];
+    const partyKindOf = await this.parties.kindsOf(contactIds);
+    const idsOfKind = (kind: ExtRecordKind) =>
+      contactIds.filter((id) => partyKindOf.get(id) === kind);
+    const [customerExternalIds, vendorExternalIds] = await Promise.all([
+      this.externalIds.findExternalIds(
+        ExtRecordKind.Customer,
+        idsOfKind(ExtRecordKind.Customer),
+      ),
+      this.externalIds.findExternalIds(
+        ExtRecordKind.Vendor,
+        idsOfKind(ExtRecordKind.Vendor),
+      ),
+    ]);
 
     journals.forEach((journal: any) => {
       const id = Number(journal.id);
@@ -436,9 +622,8 @@ export class LedgerManualJournalsService {
         id,
         externalId: externalIds.get(id) ?? null,
         journalNumber: journal.journalNumber,
-        postedAt:
-          document?.transactedAt ??
-          `${String(journal.date).slice(0, 10)}T00:00:00.000Z`,
+        postedOn: document?.transactedOn ?? String(journal.date).slice(0, 10),
+        version: document?.version ?? 1,
         description: journal.description ?? null,
         reference: journal.reference ?? null,
         createdBy: document?.createdBy ?? null,
@@ -462,6 +647,20 @@ export class LedgerManualJournalsService {
               debit: fromThousandths(toThousandths(String(entry.debit ?? 0))),
               credit: fromThousandths(toThousandths(String(entry.credit ?? 0))),
               note: entry.note ?? null,
+              customerId:
+                partyKindOf.get(Number(entry.contactId)) ===
+                ExtRecordKind.Customer
+                  ? Number(entry.contactId)
+                  : null,
+              customerExternalId:
+                customerExternalIds.get(Number(entry.contactId)) ?? null,
+              vendorId:
+                partyKindOf.get(Number(entry.contactId)) ===
+                ExtRecordKind.Vendor
+                  ? Number(entry.contactId)
+                  : null,
+              vendorExternalId:
+                vendorExternalIds.get(Number(entry.contactId)) ?? null,
               tracking: (line ? (tracking.get(line.id) ?? []) : []).map(
                 (t) => ({
                   id: t.id,
@@ -479,13 +678,13 @@ export class LedgerManualJournalsService {
 
   /**
    * Checks journals and resolves what they name, before any transaction is
-   * opened: balance, the lock, accounts, placeholder contacts and tracking.
+   * opened: accounts, balance, the lock, the party of each line and tracking.
    */
   private async prepare(
     dtos: LedgerManualJournalDto[],
+    carried: Array<{ category: string; option: string }> = [],
   ): Promise<PreparedJournal[]> {
-    const timezone = await this.lock.timezone();
-    const instants = dtos.map((dto) => toInstant(dto.postedAt));
+    const days = dtos.map((dto) => toPlainDate(dto.postedOn));
 
     const accountIds = [
       ...new Set(dtos.flatMap((dto) => dto.entries.map((e) => e.accountId))),
@@ -510,41 +709,127 @@ export class LedgerManualJournalsService {
         HttpStatus.NOT_FOUND,
       );
     }
-    // Refusals come in this order: an account not found, debits that differ
-    // from credits, then a closed period.
+    // Refusals come in this order: an account not found, one that takes no
+    // line, debits that differ from credits, a closed period, then a line
+    // that does not name its party.
+    await this.accounts.assertPostable(accountIds);
     dtos.forEach((dto) => this.assertBalanced(dto));
-    await this.lock.assertOpen(instants);
+    await this.lock.assertOpen(days);
 
-    // A line on the receivable or payable account must name a contact in
-    // Bigcapital. A journal names none, so the placeholders stand in.
-    const [placeholderCustomerId, placeholderVendorId] = await Promise.all([
-      this.settings.get<number>(WORKSPACE_SETTINGS.PLACEHOLDER_CUSTOMER_ID),
-      this.settings.get<number>(WORKSPACE_SETTINGS.PLACEHOLDER_VENDOR_ID),
-    ]);
-    const contactOf = (accountId: number): number | undefined => {
-      const slug = slugById.get(accountId);
-      if (slug === 'accounts-receivable')
-        return placeholderCustomerId ?? undefined;
-      if (slug === 'accounts-payable') return placeholderVendorId ?? undefined;
-      return undefined;
-    };
+    // What is owed by customers and to vendors is kept party by party, so a
+    // line on the receivable account names its customer and a line on the
+    // payable account its vendor.
+    // A party is named by its id or by the caller's own id of it.
+    const named = (value: unknown): boolean =>
+      value !== null && value !== undefined;
+    const customerIds = new Set<number>();
+    const vendorIds = new Set<number>();
+    const customerExternalIds = new Set<string>();
+    const vendorExternalIds = new Set<string>();
+
+    dtos.forEach((dto) =>
+      dto.entries.forEach((entry, index) => {
+        const slug = slugById.get(entry.accountId);
+        const refuse = (type: string, message: string) => {
+          throw new ServiceError(type, message, {
+            index: index + 1,
+            accountId: entry.accountId,
+          });
+        };
+        const customer =
+          named(entry.customerId) || named(entry.customerExternalId);
+        const vendor = named(entry.vendorId) || named(entry.vendorExternalId);
+
+        if (
+          (customer && vendor) ||
+          (named(entry.customerId) && named(entry.customerExternalId)) ||
+          (named(entry.vendorId) && named(entry.vendorExternalId))
+        ) {
+          refuse(
+            LEDGER_JOURNAL_ERRORS.JOURNAL_LINE_NAMES_ONE_PARTY,
+            'A journal line names one party, a customer or a vendor, and names it once.',
+          );
+        }
+        if (slug === 'accounts-receivable' && !customer) {
+          refuse(
+            LEDGER_JOURNAL_ERRORS.JOURNAL_LINE_PARTY_REQUIRED,
+            'A journal line to the receivable account names its customer.',
+          );
+        }
+        if (slug === 'accounts-payable' && !vendor) {
+          refuse(
+            LEDGER_JOURNAL_ERRORS.JOURNAL_LINE_PARTY_REQUIRED,
+            'A journal line to the payable account names its vendor.',
+          );
+        }
+        if (named(entry.customerId)) customerIds.add(entry.customerId);
+        if (named(entry.vendorId)) vendorIds.add(entry.vendorId);
+        if (named(entry.customerExternalId)) {
+          customerExternalIds.add(entry.customerExternalId);
+        }
+        if (named(entry.vendorExternalId)) {
+          vendorExternalIds.add(entry.vendorExternalId);
+        }
+      }),
+    );
+    for (const id of customerIds) {
+      await this.parties.get(ExtRecordKind.Customer, id);
+    }
+    for (const id of vendorIds) {
+      await this.parties.get(ExtRecordKind.Vendor, id);
+    }
+    const customerIdOf = new Map<string, number>();
+    const vendorIdOf = new Map<string, number>();
+
+    for (const externalId of customerExternalIds) {
+      const id = await this.parties.findByExternalId(
+        ExtRecordKind.Customer,
+        externalId,
+      );
+      if (id === null) {
+        this.parties.notFound(ExtRecordKind.Customer, { externalId });
+      }
+      customerIdOf.set(externalId, id);
+    }
+    // A vendor named by an id not seen before is made, as a bill makes one.
+    // It is made before the journal's transaction opens: Bigcapital checks a
+    // line's contact outside that transaction and would not see it.
+    for (const externalId of vendorExternalIds) {
+      vendorIdOf.set(
+        externalId,
+        await this.uow.withTransaction((trx) =>
+          this.parties.ensure(ExtRecordKind.Vendor, externalId, trx),
+        ),
+      );
+    }
+    const contactOf = (entry: LedgerManualJournalDto['entries'][number]) =>
+      entry.customerId ??
+      entry.vendorId ??
+      (named(entry.customerExternalId)
+        ? customerIdOf.get(entry.customerExternalId)
+        : undefined) ??
+      (named(entry.vendorExternalId)
+        ? vendorIdOf.get(entry.vendorExternalId)
+        : undefined) ??
+      undefined;
     const resolvedTracking = await this.tracking.resolve(
       dtos.flatMap((dto) =>
         dto.entries.flatMap((entry) => entry.tracking ?? []),
       ),
+      carried,
     );
 
     return dtos.map((dto, i) => ({
       dto,
-      postedAt: instants[i],
-      date: toLocalDay(instants[i], timezone),
+      postedOn: days[i],
+      date: days[i],
       entries: dto.entries.map((entry, index) => ({
         index: index + 1,
         accountId: entry.accountId,
         debit: Number(entry.debit),
         credit: Number(entry.credit),
         note: entry.note,
-        contactId: contactOf(entry.accountId),
+        contactId: contactOf(entry),
         trackingCategories: (entry.tracking ?? []).map((t) =>
           resolvedTracking.get(this.tracking.key(t)),
         ),
@@ -593,18 +878,14 @@ export class LedgerManualJournalsService {
     };
   }
 
-  /**
-   * Creates the journal, under the id of a deleted journal when it is one
-   * being brought back.
-   */
   private async createInTransaction(
     prepared: PreparedJournal,
     number: number,
     trx: Knex.Transaction,
-    asId?: number,
+    logged?: Logged,
   ): Promise<number> {
     // Checked again where the closing instant can no longer change.
-    await this.lock.assertOpen([prepared.postedAt], trx);
+    await this.lock.assertOpen([prepared.postedOn], trx);
 
     const createJournal = await this.locator.resolve(
       CreateManualJournalService,
@@ -616,27 +897,21 @@ export class LedgerManualJournalsService {
       ) as any,
       trx,
     );
-    const journalId = asId ?? journal.id;
+    const journalId = journal.id;
 
-    if (journalId !== journal.id) {
-      // Ids are issued in rising order and never again, so the old id is free.
-      // The entries refer to their journal by a foreign key, so the journal
-      // is copied to the old id before they are moved to it.
-      const row = await trx('manual_journals')
-        .where({ id: journal.id })
-        .first();
-      await trx('manual_journals').insert({ ...row, id: journalId });
-      await trx('manual_journals_entries')
-        .where({ manualJournalId: journal.id })
-        .update({ manualJournalId: journalId });
-      await trx('manual_journals').where({ id: journal.id }).delete();
-      await trx('accounts_transactions')
-        .where({ referenceType: 'Journal', referenceId: journal.id })
-        .update({ referenceId: journalId });
-    }
     await this.writeCompanions(journalId, prepared, trx, {
       keepLineIds: false,
     });
+    const auditId = await this.audit.record(
+      {
+        action: 'create',
+        subject: ExtRecordKind.ManualJournal,
+        subjectId: journalId,
+        number: `JE-${String(number).padStart(6, '0')}`,
+      },
+      trx,
+    );
+    logged?.push([journalId, auditId]);
     return journalId;
   }
 
@@ -660,7 +935,7 @@ export class LedgerManualJournalsService {
       ExtRecordKind.ManualJournal,
       journalId,
       {
-        transactedAt: prepared.postedAt,
+        transactedOn: prepared.postedOn,
         ...(dto.createdBy !== undefined ? { createdBy: dto.createdBy } : {}),
       },
       trx,

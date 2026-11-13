@@ -1,6 +1,7 @@
 import request = require('supertest');
 import { INestApplication } from '@nestjs/common';
 import {
+  change,
   createTestApp,
   createTestWorkspace,
   dropOrganizations,
@@ -22,16 +23,19 @@ import {
  *   Import     dated the last millisecond of 31 Dec in US Eastern time,
  *              which is 31 Dec in Chicago too:
  *                1010 Operating    debit  1,000.50   against 3900
- *                1200 Receivables  debit    200.00   against 3900
- *                2010 Payables     credit   300.25   against 3900
+ *                1300 Deposits     debit    200.00   against 3900
+ *                2300 Accrued      credit   300.25   against 3900
  *                3900 itself       credit   900.25   against itself: nothing
  *
  * So, each account's own balance, with everything in:
- *   1010 +1,000.50   1200 +200.00   2010 -300.25
+ *   1010 +1,000.50   1300 +200.00   2300 -300.25
  *   1590 -460.00     6500 +460.00
  *   3900 = -30,000 + 42,000 - 1,000.50 - 200 + 300.25 = +11,099.75
- * and once the import is deleted: 3900 = +12,000.00, and 1010, 1200 and
- * 2010 hold nothing.
+ * and once the import is deleted: 3900 = +12,000.00, and 1010, 1300 and
+ * 2300 hold nothing.
+ *
+ * The import takes no row on Receivables or Payables: what was owed either
+ * way comes in as opening invoices and bills.
  */
 const chart = () => [
   { code: '1000', name: 'Assets', account_type: 'other-current-asset' },
@@ -46,6 +50,12 @@ const chart = () => [
     name: 'Receivables',
     account_type: 'accounts-receivable',
     slug: 'accounts-receivable',
+    parent_code: '1000',
+  },
+  {
+    code: '1300',
+    name: 'Deposits',
+    account_type: 'other-current-asset',
     parent_code: '1000',
   },
   {
@@ -75,6 +85,12 @@ const chart = () => [
     parent_code: '2000',
   },
   {
+    code: '2300',
+    name: 'Accrued',
+    account_type: 'other-current-liability',
+    parent_code: '2000',
+  },
+  {
     code: '3900',
     name: 'Opening Equity',
     account_type: 'equity',
@@ -89,8 +105,8 @@ const chart = () => [
   },
 ];
 
-const OPENED = '2031-01-02T18:00:00.000Z';
-const IMPORT_AT = '2031-01-01T04:59:59.999Z';
+const OPENED = '2031-01-02';
+const IMPORT_AT = '2030-12-31';
 
 describe('Ledger extension: fixed assets, loans and opening balances', () => {
   let app: INestApplication;
@@ -105,16 +121,11 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
   const get = (path: string, query: Record<string, unknown> = {}) =>
     http().get(path).query(query).set(ws.headers());
   const post = (path: string, body: unknown = {}) =>
-    http()
-      .post(path)
-      .set(ws.headers())
-      .send(body as any);
+    change(app, 'post', path, ws.headers(), body);
   const put = (path: string, body: unknown) =>
-    http()
-      .put(path)
-      .set(ws.headers())
-      .send(body as any);
-  const del = (path: string) => http().delete(path).set(ws.headers());
+    change(app, 'put', path, ws.headers(), body);
+  const del = (path: string) => change(app, 'delete', path, ws.headers());
+  const error = (res: request.Response) => res.body?.errors?.[0];
   const errorType = (res: request.Response) => res.body?.errors?.[0]?.type;
 
   const accounts = async () =>
@@ -164,17 +175,24 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       salvage_value: '3000.00',
       useful_life_months: 60,
       metadata: { plateNumber: 'ABC 123' },
-      opening: { amount: '30000.00', posted_at: '2031-01-02T12:00:00-06:00' },
+      funding: {
+        amount: '30000.00',
+        posted_on: '2031-01-02',
+        from: 'opening',
+      },
       ...extra,
     });
 
     it('is made with an account of its own under the marked account, and its opening entry', async () => {
       const res = await post('/ledger/fixed-assets', body());
       expect(res.status).toBe(201);
+      // A first create is no retry, and says nothing of one.
+      expect(res.body).not.toHaveProperty('replayed');
       truck = res.body.data;
       expect(truck).toEqual({
         id: expect.any(Number),
         external_id: 'fa-1',
+        version: 1,
         name: 'Truck',
         asset_type: 'VEHICLE',
         cost: '30000.00',
@@ -189,7 +207,12 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
           metadata: null,
         },
         accumulated_account: null,
-        opening: { amount: '30000.00', posted_at: OPENED },
+        funding: {
+          amount: '30000.00',
+          posted_on: OPENED,
+          from: 'opening',
+          account_id: null,
+        },
         created_at: expect.any(String),
       });
       const account = (await accounts()).find((a) => a.id === truck.account.id);
@@ -202,23 +225,51 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         (e: any) => e.source_type === 'opening_balance',
       );
       expect(opening.description).toBe('Opening balance for Truck');
-      expect(opening.posted_at).toBe(OPENED);
+      expect(opening.posted_on).toBe(OPENED);
       expect(await rowsOf('OpeningBalance', opening.source_id)).toEqual([
         ['2031-01-02', 'both', '3900', '-30000.00'],
         ['2031-01-02', 'both', 'Truck', '30000.00'],
       ]);
     });
 
-    it('answers the first asset unchanged when its external id is sent again', async () => {
-      const again = await post(
-        '/ledger/fixed-assets',
-        body({ name: 'Another', cost: '1.00', opening: null }),
+    it('a repeat of its external id is a retry with the same body, and refused with another', async () => {
+      // The truck alone is in the books: 30,000.00 on its own account,
+      // against opening balance equity.
+      const books = { Truck: '30000.00', '3900': '-30000.00' };
+      expect(await own()).toEqual(books);
+
+      const retry = await post('/ledger/fixed-assets', body());
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: truck, replayed: true });
+
+      const bodies = [
+        body({ name: 'Another', cost: '1.00', funding: null }),
+        body({ salvage_value: '3000.01' }),
+        body({ metadata: { plateNumber: 'XYZ 789' } }),
+      ];
+      for (const other of bodies) {
+        const again = await post('/ledger/fixed-assets', other);
+        expect(again.status).toBe(409);
+        expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+        expect(error(again).payload).toEqual({
+          kind: 'fixed_asset',
+          externalId: 'fa-1',
+          recordId: truck.id,
+          state: 'live',
+          version: 1,
+        });
+      }
+      // One asset, one account of its own, one opening entry: as they were.
+      expect((await get(`/ledger/fixed-assets/${truck.id}`)).body.data).toEqual(
+        truck,
       );
-      expect(again.status).toBe(201);
-      expect(again.body.data).toEqual(truck);
       expect(
         (await get('/ledger/fixed-assets').expect(200)).body.pagination.total,
       ).toBe(1);
+      expect((await accounts()).filter((a) => a.name === 'Truck')).toHaveLength(
+        1,
+      );
+      expect(await own()).toEqual(books);
     });
 
     it('refuses a value update while it has no accumulated account', async () => {
@@ -226,7 +277,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         asset_id: truck.id,
         amount: '450.00',
         update_type: 'DEPRECIATION_AMORTIZATION',
-        posted_at: '2031-01-31T18:00:00Z',
+        posted_on: '2031-01-31',
         counter_account_slug: 'depreciation',
       });
       expect(res.status).toBe(400);
@@ -239,6 +290,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         accumulated_account_slug: 'accumulated-depreciation',
       });
       expect(res.status).toBe(200);
+      // Made at 1, and each of the three edits here raises it by one.
       expect(res.body.data).toEqual({
         ...truck,
         name: 'Truck 2',
@@ -249,6 +301,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
           account_type: 'fixed-asset',
           metadata: null,
         },
+        version: 2,
       });
       truck = res.body.data;
 
@@ -261,6 +314,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         ...truck,
         useful_life_months: 48,
         salvage_value: null,
+        version: 3,
       });
       truck = (
         await put(`/ledger/fixed-assets/${truck.id}`, {
@@ -271,6 +325,74 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       expect((await get(`/ledger/fixed-assets/${truck.id}`)).body.data).toEqual(
         truck,
       );
+      expect([truck.useful_life_months, truck.version]).toEqual([60, 4]);
+    });
+
+    it('is edited from the version it was read at: an old version or none is refused, and nothing is written', async () => {
+      const path = `/ledger/fixed-assets/${truck.id}`;
+      const current = (await get(path)).body.data;
+      expect(current.version).toBe(4);
+
+      const stale = await put(path, { name: 'Late Truck', version: 3 });
+      expect(stale.status).toBe(409);
+      expect(errorType(stale)).toBe('STALE_VERSION');
+      expect(error(stale).payload).toEqual({ current });
+
+      const none = await http()
+        .put(path)
+        .set(ws.headers())
+        .send({ name: 'Unversioned Truck' });
+      expect(none.status).toBe(400);
+      expect(errorType(none)).toBe('VERSION_REQUIRED');
+      expect((await get(path)).body.data).toEqual(current);
+
+      // From the version it has, the edit lands: 4 to 5. Then back, 5 to 6,
+      // so the asset is named as the tests after this one expect.
+      const landed = await put(path, { name: 'Truck 3', version: 4 });
+      expect(landed.status).toBe(200);
+      expect(landed.body.data).toEqual({
+        ...current,
+        name: 'Truck 3',
+        version: 5,
+      });
+      truck = (await put(path, { name: 'Truck 2', version: 5 })).body.data;
+      expect(truck).toEqual({ ...current, version: 6 });
+
+      // Not found is answered before the version is looked at.
+      const missing = await http()
+        .put('/ledger/fixed-assets/99999999')
+        .set(ws.headers())
+        .send({ name: 'Nothing' });
+      expect(missing.status).toBe(404);
+      expect(errorType(missing)).toBe('fixed_asset_not_found');
+    });
+
+    it('eight simultaneous creates of one external id and body make one asset', async () => {
+      // A trailer with no funding: it posts nothing, so the books stay the
+      // truck's 30,000.00 against opening balance equity.
+      const trailer = {
+        external_id: 'fa-8',
+        name: 'Trailer',
+        asset_type: 'VEHICLE',
+        cost: '8000.00',
+      };
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () => post('/ledger/fixed-assets', trailer)),
+      );
+      expect(results.map((r) => [r.status, r.body.replayed]).sort()).toEqual([
+        ...Array.from({ length: 7 }, () => [200, true]),
+        [201, undefined],
+      ]);
+      expect(new Set(results.map((r) => r.body.data.id)).size).toBe(1);
+      expect(results[0].body.data.version).toBe(1);
+      expect(
+        await ws.rows('ext_fixed_assets', { name: 'Trailer' }),
+      ).toHaveLength(1);
+      expect(
+        (await accounts()).filter((a) => a.name === 'Trailer'),
+      ).toHaveLength(1);
+      expect((await get('/ledger/fixed-assets')).body.pagination.total).toBe(2);
+      expect(await own()).toEqual({ Truck: '30000.00', '3900': '-30000.00' });
     });
 
     it('refuses an account named twice, an unknown slug, an unknown account and an unknown asset', async () => {
@@ -304,7 +426,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       asset_id: truck.id,
       amount: '450.00',
       update_type: 'DEPRECIATION_AMORTIZATION',
-      posted_at: '2031-01-31T18:00:00Z',
+      posted_on: '2031-01-31',
       note: 'January',
       counter_account_slug: 'depreciation',
       ...extra,
@@ -313,6 +435,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
     it('debits the counter account and credits the accumulated account', async () => {
       const res = await post('/ledger/fixed-assets/value-updates', body());
       expect(res.status).toBe(201);
+      expect(res.body).not.toHaveProperty('replayed');
       u1 = res.body.data;
       expect(u1).toEqual({
         id: expect.any(Number),
@@ -320,7 +443,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         asset_id: truck.id,
         amount: '450.00',
         update_type: 'DEPRECIATION_AMORTIZATION',
-        posted_at: '2031-01-31T18:00:00.000Z',
+        posted_on: '2031-01-31',
         note: 'January',
         counter_account: {
           id: id['6500'],
@@ -351,13 +474,34 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       ]);
     });
 
-    it('answers the first update unchanged when its external id is sent again', async () => {
+    it('a repeat of its external id is a retry with the same body, and refused with another', async () => {
+      const retry = await post('/ledger/fixed-assets/value-updates', body());
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: u1, replayed: true });
+
       const again = await post(
         '/ledger/fixed-assets/value-updates',
         body({ amount: '1.00' }),
       );
-      expect(again.status).toBe(201);
-      expect(again.body.data).toEqual(u1);
+      expect(again.status).toBe(409);
+      expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+      // A value update is never edited, so it has no version to name.
+      expect(error(again).payload).toEqual({
+        kind: 'fixed_asset_value_update',
+        externalId: 'vu-1',
+        recordId: u1.id,
+        state: 'live',
+        version: null,
+      });
+      // The one 450.00, posted once.
+      expect(await rowsOf('FixedAssetValueUpdate', u1.id)).toEqual([
+        ['2031-01-31', 'both', '1590', '-450.00'],
+        ['2031-01-31', 'both', '6500', '450.00'],
+      ]);
+      expect(
+        (await get('/ledger/fixed-assets/value-updates')).body.pagination.total,
+      ).toBe(1);
+      expect((await own())['6500']).toBe('450.00');
     });
 
     it('is listed oldest dated first, and for one asset when one is named', async () => {
@@ -367,7 +511,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
           body({
             external_id: 'vu-2',
             amount: '10.00',
-            posted_at: '2031-01-15T18:00:00Z',
+            posted_on: '2031-01-15',
             note: null,
             counter_account_slug: null,
             counter_account_id: id['6500'],
@@ -397,7 +541,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
 
     it('is refused in a locked period, with no counter account, and for an unknown asset', async () => {
       await put('/ledger/settings', {
-        closing_at: '2031-02-01T00:00:00-06:00',
+        locked_through: '2031-01-31',
       }).expect(200);
       try {
         const locked = await post(
@@ -407,7 +551,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         expect(locked.status).toBe(400);
         expect(errorType(locked)).toBe('TRANSACTIONS_DATE_LOCKED');
       } finally {
-        await put('/ledger/settings', { closing_at: null }).expect(200);
+        await put('/ledger/settings', { locked_through: null }).expect(200);
       }
       const noCounter = await post(
         '/ledger/fixed-assets/value-updates',
@@ -436,7 +580,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       origination_date: '2030-06-01',
       original_principal: '50000.00',
       loan_term_months: 60,
-      opening: { amount: '42000.00', posted_at: OPENED },
+      funding: { amount: '42000.00', posted_on: OPENED, from: 'opening' },
       ...extra,
     });
 
@@ -462,7 +606,12 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
           metadata: null,
         },
         balance: '42000.00',
-        opening: { amount: '42000.00', posted_at: OPENED },
+        funding: {
+          amount: '42000.00',
+          posted_on: OPENED,
+          from: 'opening',
+          account_id: null,
+        },
         created_at: expect.any(String),
       });
       const account = (await accounts()).find((a) => a.id === note.account.id);
@@ -480,10 +629,27 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       ]);
     });
 
-    it('answers the first loan unchanged when its external id is sent again, and is read and listed', async () => {
+    it('a repeat of its external id is a retry with the same body, and refused with another; it is read and listed', async () => {
+      const retry = await post('/ledger/loans', body());
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual({ data: note, replayed: true });
+
       const again = await post('/ledger/loans', body({ name: 'Other' }));
-      expect(again.status).toBe(201);
-      expect(again.body.data).toEqual(note);
+      expect(again.status).toBe(409);
+      expect(errorType(again)).toBe('EXTERNAL_ID_IN_USE');
+      // A loan is never edited, so it has no version to name.
+      expect(error(again).payload).toEqual({
+        kind: 'loan',
+        externalId: 'loan-1',
+        recordId: note.id,
+        state: 'live',
+        version: null,
+      });
+      // Still the one 42,000.00 owed on the one account.
+      expect(
+        (await accounts()).filter((a) => a.name === 'Bank Note'),
+      ).toHaveLength(1);
+      expect((await own())['Bank Note']).toBe('-42000.00');
       expect((await get(`/ledger/loans/${note.id}`)).body.data).toEqual(note);
 
       const list = await get('/ledger/loans').expect(200);
@@ -504,14 +670,14 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         debit: '1000.50',
         credit: '0.00',
       },
-      { name: 'receivables', debit: '200.00', credit: '0' },
-      { code: '2010', debit: '0', credit: '300.25' },
+      { name: 'deposits', debit: '200.00', credit: '0' },
+      { code: '2300', debit: '0', credit: '300.25' },
       { code: '3900', debit: '0.00', credit: '900.25' },
     ];
 
     it('are refused whole when a row names no account of the chart', async () => {
       const res = await post('/ledger/opening-balances', {
-        posted_at: IMPORT_AT,
+        posted_on: IMPORT_AT,
         balances: [...balances(), { code: '7777', debit: '1.00', credit: '0' }],
       });
       expect(res.status).toBe(400);
@@ -519,7 +685,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       expect((await own())['1010']).toBeUndefined();
 
       const twice = await post('/ledger/opening-balances', {
-        posted_at: IMPORT_AT,
+        posted_on: IMPORT_AT,
         balances: [
           { code: '1010', debit: '1.00', credit: '0' },
           { name: 'Operating', debit: '1.00', credit: '0' },
@@ -529,9 +695,48 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       expect(errorType(twice)).toBe('OPENING_ACCOUNT_NAMED_TWICE');
     });
 
+    it('are refused whole when a row is on the receivable or the payable account', async () => {
+      const rows = (await ws.rows('accounts_transactions')).length;
+      const withRow = (row: Record<string, unknown>) =>
+        post('/ledger/opening-balances', {
+          posted_on: IMPORT_AT,
+          balances: [{ code: '1010', debit: '200.00', credit: '0' }, row],
+        });
+
+      const receivable = await withRow({
+        name: 'receivables',
+        debit: '0',
+        credit: '200.00',
+      });
+      expect(receivable.status).toBe(400);
+      expect(errorType(receivable)).toBe('OPENING_CONTROL_ACCOUNT_ROW');
+      expect(error(receivable).payload).toEqual({
+        index: 1,
+        accountId: id['1200'],
+      });
+
+      const payable = await withRow({
+        code: '2010',
+        debit: '0',
+        credit: '200.00',
+      });
+      expect(payable.status).toBe(400);
+      expect(errorType(payable)).toBe('OPENING_CONTROL_ACCOUNT_ROW');
+      expect(error(payable).payload).toEqual({
+        index: 1,
+        accountId: id['2010'],
+      });
+
+      expect((await own())['1010']).toBeUndefined();
+      expect(await ws.rows('accounts_transactions')).toHaveLength(rows);
+      expect((await get('/ledger/opening-balances')).body.data).toEqual({
+        balances: [],
+      });
+    });
+
     it('are imported one entry an account, and answered in each account own direction', async () => {
       const res = await post('/ledger/opening-balances', {
-        posted_at: IMPORT_AT,
+        posted_on: IMPORT_AT,
         balances: balances(),
       });
       expect(res.status).toBe(201);
@@ -539,12 +744,12 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
         res.body.data.balances.map((b: any) => [
           b.account.code,
           b.amount,
-          b.posted_at,
+          b.posted_on,
         ]),
       ).toEqual([
         ['1010', '1000.50', IMPORT_AT],
-        ['1200', '200.00', IMPORT_AT],
-        ['2010', '300.25', IMPORT_AT],
+        ['1300', '200.00', IMPORT_AT],
+        ['2300', '300.25', IMPORT_AT],
         ['3900', '900.25', IMPORT_AT],
       ]);
       expect((await get('/ledger/opening-balances')).body.data).toEqual(
@@ -555,9 +760,9 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
     it('give the hand-worked books', async () => {
       expect(await own()).toEqual({
         '1010': '1000.50',
-        '1200': '200.00',
+        '1300': '200.00',
         '1590': '-460.00',
-        '2010': '-300.25',
+        '2300': '-300.25',
         '3900': '11099.75',
         '6500': '460.00',
         Truck: '30000.00',
@@ -565,14 +770,14 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       });
     });
 
-    it('post on the Central day of the instant, with a contact on the receivable and the payable', async () => {
+    it('post on the Central day of the instant, with no contact on any row', async () => {
       const entries = (await feed()).filter(
-        (e: any) => e.posted_at === IMPORT_AT,
+        (e: any) => e.posted_on === IMPORT_AT,
       );
       expect(entries.map((e: any) => [e.source_type, e.description])).toEqual([
         ['opening_balance', 'Opening balance for Operating'],
-        ['opening_balance', 'Opening balance for Receivables'],
-        ['opening_balance', 'Opening balance for Payables'],
+        ['opening_balance', 'Opening balance for Deposits'],
+        ['opening_balance', 'Opening balance for Accrued'],
         ['opening_balance', 'Opening balance for Opening Equity'],
       ]);
       expect(await rowsOf('OpeningBalance', entries[0].source_id)).toEqual([
@@ -587,18 +792,15 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
       const rows = await ws.rows('accounts_transactions', {
         referenceType: 'OpeningBalance',
       });
-      const contactOn = (code: string) =>
-        rows
-          .filter((row) => row.accountId === id[code])
-          .map((row) => row.contactId);
-      expect(contactOn('1200')).toEqual([expect.any(Number)]);
-      expect(contactOn('2010')).toEqual([expect.any(Number)]);
-      expect(contactOn('1010')).toEqual([null]);
+      // The asset's opening, the loan's, and two rows for each of the four
+      // imported: twelve rows, and none names a contact.
+      expect(rows).toHaveLength(12);
+      expect(rows.filter((row) => row.contactId !== null)).toEqual([]);
     });
 
     it('are refused a second time, until the first are deleted', async () => {
       const res = await post('/ledger/opening-balances', {
-        posted_at: IMPORT_AT,
+        posted_on: IMPORT_AT,
         balances: balances(),
       });
       expect(res.status).toBe(400);
@@ -607,14 +809,14 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
 
     it('are held by the lock, on import and on delete', async () => {
       await put('/ledger/settings', {
-        closing_at: '2031-01-01T00:00:00-06:00',
+        locked_through: '2030-12-31',
       }).expect(200);
       try {
         const res = await del('/ledger/opening-balances');
         expect(res.status).toBe(400);
         expect(errorType(res)).toBe('TRANSACTIONS_DATE_LOCKED');
       } finally {
-        await put('/ledger/settings', { closing_at: null }).expect(200);
+        await put('/ledger/settings', { locked_through: null }).expect(200);
       }
     });
 
@@ -640,7 +842,7 @@ describe('Ledger extension: fixed assets, loans and opening balances', () => {
 
     it('can be imported again once deleted', async () => {
       const res = await post('/ledger/opening-balances', {
-        posted_at: IMPORT_AT,
+        posted_on: IMPORT_AT,
         balances: [
           { code: '1010', debit: '5.00', credit: '0' },
           { code: '3900', debit: '0', credit: '5.00' },

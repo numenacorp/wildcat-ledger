@@ -1,4 +1,11 @@
-import { IsOptional, IsString, MaxLength, ValidateIf } from 'class-validator';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  MaxLength,
+  Min,
+  ValidateIf,
+} from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { StrictDto } from '@/common/decorators/StrictDto';
 import { EXTERNAL_ID_MAX_LENGTH } from '../LedgerExt.constants';
@@ -38,4 +45,17 @@ export class UpsertLedgerVendorDto {
 
   @optionalText(10000)
   notes?: string | null;
+}
+
+/** A vendor's or a customer's fields replaced, from the version they were read at. */
+@StrictDto()
+export class UpdateLedgerVendorDto extends UpsertLedgerVendorDto {
+  @ApiProperty({
+    description: 'The version of the record the change was made from',
+    required: false,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
 }

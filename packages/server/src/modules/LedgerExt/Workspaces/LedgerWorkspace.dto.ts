@@ -2,15 +2,18 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
-  IsIn,
+  IsBoolean,
   IsISO31661Alpha2,
   IsISO4217CurrencyCode,
-  IsISO8601,
+  IsIn,
+  IsInt,
   IsNotEmpty,
   IsObject,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
+  Min,
   ValidateNested,
 } from 'class-validator';
 import * as momentTz from 'moment-timezone';
@@ -59,6 +62,15 @@ export class WorkspaceChartAccountDto {
   @IsOptional()
   @IsString()
   slug?: string;
+
+  @ApiProperty({
+    description:
+      'Marks the entry as the heading of its root type, which groups accounts and takes no postings',
+    required: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  typeRoot?: boolean;
 
   @ApiProperty({ required: false })
   @IsOptional()
@@ -111,8 +123,21 @@ export class CreateLedgerWorkspaceDto {
     required: false,
   })
   @IsOptional()
-  @IsISO8601({ strict: true })
-  booksStartAt?: string;
+  @IsString()
+  booksStartOn?: string;
+
+  @ApiProperty({
+    description:
+      'The first month of the fiscal year, 1 for January. January when none is sent',
+    required: false,
+    minimum: 1,
+    maximum: 12,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(12)
+  fiscalYearStartMonth?: number;
 
   @ApiProperty({
     description:
@@ -135,13 +160,26 @@ export class UpdateLedgerWorkspaceDto {
     required: false,
   })
   @IsOptional()
-  @IsISO8601({ strict: true })
-  booksStartAt?: string;
+  @IsString()
+  booksStartOn?: string;
 
   @ApiProperty({ enum: ReportingBasis, required: false })
   @IsOptional()
   @IsIn(Object.values(ReportingBasis))
   reportingBasis?: ReportingBasis;
+
+  @ApiProperty({
+    description:
+      'The first month of the fiscal year, 1 for January. January when none is sent',
+    required: false,
+    minimum: 1,
+    maximum: 12,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(12)
+  fiscalYearStartMonth?: number;
 }
 
 export class LedgerWorkspaceResponseDto {
@@ -172,7 +210,10 @@ export class LedgerWorkspaceResponseDto {
   reportingBasis: ReportingBasis;
 
   @ApiProperty({ nullable: true })
-  booksStartAt: string | null;
+  booksStartOn: string | null;
+
+  @ApiProperty({ description: 'The first month of the fiscal year, 1 to 12' })
+  fiscalYearStartMonth: number;
 
   @ApiProperty({ nullable: true })
   inactiveAt: string | null;

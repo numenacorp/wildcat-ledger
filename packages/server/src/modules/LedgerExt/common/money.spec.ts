@@ -3,7 +3,7 @@ import {
   fromCents,
   isDecimal,
   lineCents,
-  prorate,
+  shareOut,
   toCents,
 } from './money';
 
@@ -49,39 +49,70 @@ describe('money', () => {
   });
 
   describe('sharing a payment over lines', () => {
-    it('one cent on three one-cent lines goes to the third', () => {
-      expect(prorate(1n, [1n, 1n, 1n])).toEqual([0n, 0n, 1n]);
+    // Each expected share is worked by hand: the exact share, rounded down,
+    // then the cents left over to the largest fractions lost.
+    it('one cent on three one-cent lines goes to the first', () => {
+      // A third of a cent each: all round down to 0, one cent left, a tie.
+      expect(shareOut(1n, [1n, 1n, 1n])).toEqual([1n, 0n, 0n]);
     });
 
-    it('0.05 on lines of 7.00, 1.00 and 2.00 is 0.03, 0.01 and 0.01', () => {
-      // 3.5, 0.5 and 1 round to 4, 1 and 1: a cent too many, off the 7.00.
-      expect(prorate(5n, [700n, 100n, 200n])).toEqual([3n, 1n, 1n]);
+    it('0.05 on lines of 7.00, 1.00 and 2.00 is 0.04, 0.00 and 0.01', () => {
+      // 3.5, 0.5 and 1: down to 3, 0 and 1, one cent left, to the earlier
+      // of the two halves.
+      expect(shareOut(5n, [700n, 100n, 200n])).toEqual([4n, 0n, 1n]);
     });
 
     it('0.01 on lines of 0.03 and -0.01 is 0.02 and -0.01', () => {
-      // 1.5 and -0.5 round away from zero.
-      expect(prorate(1n, [3n, -1n])).toEqual([2n, -1n]);
+      // 1.5 and -0.5: down to 1 and -1, one cent left, to the first.
+      expect(shareOut(1n, [3n, -1n])).toEqual([2n, -1n]);
     });
 
     it('a payment in full is the lines themselves', () => {
-      expect(prorate(1000n, [700n, 100n, 200n])).toEqual([700n, 100n, 200n]);
+      expect(shareOut(1000n, [700n, 100n, 200n])).toEqual([700n, 100n, 200n]);
+      expect(shareOut(119n, [59n, 60n])).toEqual([59n, 60n]);
+      expect(shareOut(-3n, [5n, -8n])).toEqual([5n, -8n]);
     });
 
     it('half of 10.00 on lines of 3.33, 3.33 and 3.34', () => {
-      // 1.665, 1.665 and 1.67 round to 1.67 each: a cent too many, off the
-      // largest line, the 3.34.
-      expect(prorate(500n, [333n, 333n, 334n])).toEqual([167n, 167n, 166n]);
+      // 166.5, 166.5 and 167: down to 166, 166 and 167, one cent left, to
+      // the earlier of the two halves.
+      expect(shareOut(500n, [333n, 333n, 334n])).toEqual([167n, 166n, 167n]);
+    });
+
+    it('0.79 on two lines of 0.99 is 0.40 and 0.39', () => {
+      expect(shareOut(79n, [99n, 99n])).toEqual([40n, 39n]);
+    });
+
+    it('a cent short goes to the line that lost most, a negative one too', () => {
+      // 379,677.54 on lines of 3,711.02, 3.33, 999,999.99 and -466,644.49.
+      // Exact: 262347.80, 235.41, 70694256.29 and -32989085.50. Down:
+      // 262347, 235, 70694256 and -32989086, two cents short. The fractions
+      // lost are .80, .41, .29 and .50: the first and the last line.
+      expect(
+        shareOut(37967754n, [371102n, 333n, 99999999n, -46664449n]),
+      ).toEqual([262348n, 235n, 70694256n, -32989085n]);
+    });
+
+    it('never goes past what is left on a line', () => {
+      const unpaid = [47n, 47n, 47n];
+      for (let paid = 0n; paid <= 141n; paid += 1n) {
+        const shares = shareOut(paid, unpaid);
+        expect(shares.reduce((a, b) => a + b, 0n)).toBe(paid);
+        shares.forEach((share, n) => {
+          expect(share >= 0n && share <= unpaid[n]).toBe(true);
+        });
+      }
     });
 
     it('lines that total zero, or no lines, get nothing', () => {
-      expect(prorate(100n, [50n, -50n])).toEqual([0n, 0n]);
-      expect(prorate(100n, [])).toEqual([]);
+      expect(shareOut(100n, [50n, -50n])).toEqual([0n, 0n]);
+      expect(shareOut(100n, [])).toEqual([]);
     });
 
     it('always adds up to what was paid', () => {
       const lines = [1234n, 1n, 999n, -17n, 50000n];
       for (const paid of [1n, 7n, 333n, 52216n, 52217n]) {
-        expect(prorate(paid, lines).reduce((a, b) => a + b, 0n)).toBe(paid);
+        expect(shareOut(paid, lines).reduce((a, b) => a + b, 0n)).toBe(paid);
       }
     });
   });

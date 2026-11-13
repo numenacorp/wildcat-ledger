@@ -24,6 +24,12 @@ export interface ChartAccountInput {
    * for that account instead of creating a second one.
    */
   slug?: string | null;
+  /**
+   * Marks the entry as the heading of its root type: it groups the accounts
+   * of the type and takes no postings. It has no parent, and a chart holds
+   * one for a root type at most.
+   */
+  typeRoot?: boolean | null;
   description?: string | null;
   metadata?: Record<string, unknown> | null;
 }
@@ -65,6 +71,7 @@ export function findChartProblems(
   const byCode = new Map<string, ChartAccountInput>();
   const seenSlugs = new Set<string>();
   const singles = new Map<string, number>();
+  const rootsSeen = new Set<string>();
 
   accounts.forEach((account, index) => {
     const report = (problem: string) =>
@@ -83,6 +90,20 @@ export function findChartProblems(
       singles.set(account.accountType, count);
       if (count > 1) {
         report(`Only one account of type "${account.accountType}" is allowed.`);
+      }
+    }
+    if (account.typeRoot) {
+      const rootType = rootTypeOf(account.accountType);
+
+      if (account.parentCode) {
+        report('A type root has no parent.');
+      }
+      if (rootType && rootsSeen.has(rootType)) {
+        report(`The chart marks more than one type root for ${rootType}.`);
+      }
+      if (rootType) rootsSeen.add(rootType);
+      if (account.slug || SINGLE_ACCOUNT_TYPES.includes(account.accountType)) {
+        report('A type root is not an account documents post to.');
       }
     }
     if (account.slug && isMarkedAccountSlug(account.slug)) {

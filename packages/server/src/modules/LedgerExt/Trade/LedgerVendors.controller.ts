@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   Post,
+  Put,
   Query,
   Res,
   UseGuards,
@@ -14,7 +15,11 @@ import { ApiCommonHeaders } from '@/common/decorators/ApiCommonHeaders';
 import { LedgerWorkspaceGuard } from '../Workspaces/LedgerWorkspace.guard';
 import { ExtRecordKind } from '../LedgerExt.constants';
 import { ExtPartiesService } from './ExtParties.service';
-import { UpsertLedgerVendorDto } from './LedgerVendor.dto';
+import {
+  UpdateLedgerVendorDto,
+  UpsertLedgerVendorDto,
+} from './LedgerVendor.dto';
+import { created as answer } from '../common/Version.dto';
 
 @ApiTags('Ledger: Vendors')
 @Controller('ledger/vendors')
@@ -26,19 +31,28 @@ export class LedgerVendorsController {
   @Post()
   @ApiOperation({
     summary:
-      'Create a vendor, or replace the fields of the one carrying the external id',
+      'Create a vendor. A repeat of an external id with the same fields answers the vendor; with other fields it is refused',
   })
-  async upsert(
+  async create(
     @Body() dto: UpsertLedgerVendorDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { party, created } = await this.parties.upsert(
+    const { party, created, replayed } = await this.parties.create(
       ExtRecordKind.Vendor,
       dto,
     );
 
     response.status(created ? 201 : 200);
-    return { data: party };
+    return answer(party, replayed);
+  }
+
+  @Put(':id')
+  @ApiOperation({ summary: 'Replace the fields of a vendor' })
+  async update(@Param('id') id: string, @Body() dto: UpdateLedgerVendorDto) {
+    const { externalId: _externalId, ...fields } = dto;
+    return {
+      data: await this.parties.update(ExtRecordKind.Vendor, Number(id), fields),
+    };
   }
 
   @Get(':id')
@@ -58,18 +72,31 @@ export class LedgerCustomersController {
   @Post()
   @ApiOperation({
     summary:
-      'Create a customer, or replace the fields of the one carrying the external id',
+      'Create a customer. A repeat of an external id with the same fields answers the customer; with other fields it is refused',
   })
-  async upsert(
+  async create(
     @Body() dto: UpsertLedgerVendorDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { party, created } = await this.parties.upsert(
+    const { party, created, replayed } = await this.parties.create(
       ExtRecordKind.Customer,
       dto,
     );
     response.status(created ? 201 : 200);
-    return { data: party };
+    return answer(party, replayed);
+  }
+
+  @Put(':id')
+  @ApiOperation({ summary: 'Replace the fields of a customer' })
+  async update(@Param('id') id: string, @Body() dto: UpdateLedgerVendorDto) {
+    const { externalId: _externalId, ...fields } = dto;
+    return {
+      data: await this.parties.update(
+        ExtRecordKind.Customer,
+        Number(id),
+        fields,
+      ),
+    };
   }
 
   @Get()

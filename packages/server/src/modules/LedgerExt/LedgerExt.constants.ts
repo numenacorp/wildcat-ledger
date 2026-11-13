@@ -13,6 +13,11 @@ export enum ExtRecordKind {
   SaleInvoice = 'sale_invoice',
   SaleInvoiceEntry = 'sale_invoice_entry',
   PaymentReceived = 'payment_received',
+  VendorCredit = 'vendor_credit',
+  VendorCreditEntry = 'vendor_credit_entry',
+  CreditNote = 'credit_note',
+  CreditNoteEntry = 'credit_note_entry',
+  CreditApplication = 'credit_application',
   Vendor = 'vendor',
   Customer = 'customer',
   TrackingCategory = 'tracking_category',
@@ -21,12 +26,16 @@ export enum ExtRecordKind {
   FixedAssetValueUpdate = 'fixed_asset_value_update',
   OpeningBalance = 'opening_balance',
   Loan = 'loan',
+  Lock = 'lock',
+  LockException = 'lock_exception',
 }
 
 export const ERRORS = {
   EXTERNAL_ID_IN_USE: 'EXTERNAL_ID_IN_USE',
+  EXTERNAL_ID_FIXED: 'EXTERNAL_ID_FIXED',
   METADATA_NOT_SERIALIZABLE: 'METADATA_NOT_SERIALIZABLE',
   INVALID_TIMESTAMP: 'INVALID_TIMESTAMP',
+  DATE_NOT_PLAIN: 'DATE_NOT_PLAIN',
 };
 
 /** Longest `external_id` accepted on any record. */

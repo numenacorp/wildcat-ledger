@@ -9,7 +9,7 @@ import {
 import { ExtLinesService } from '../common/ExtLines.service';
 import { inChunks } from '../common/chunks';
 import { fromThousandths, toThousandths } from '../common/decimal';
-import { toInstant } from '../common/timestamps';
+import { toPlainDate } from '../common/timestamps';
 import { ExtRecordKind } from '../LedgerExt.constants';
 import { ExtAccountTreeService } from '../Accounts/ExtAccountTree.service';
 import { LedgerAccountsService } from '../Accounts/LedgerAccounts.service';
@@ -24,7 +24,7 @@ export interface LedgerLineView {
   account: { id: number; code: string | null; name: string | null };
   debit: string;
   credit: string;
-  postedAt: string;
+  postedOn: string;
   tracking: Array<{ category: string; option: string; optionName: string }>;
 }
 
@@ -32,7 +32,7 @@ export interface LedgerEntryView {
   sourceType: string;
   sourceId: number;
   number: string | null;
-  postedAt: string;
+  postedOn: string;
   description: string | null;
   reference: string | null;
   entries: LedgerLineView[];
@@ -44,9 +44,9 @@ interface PageQuery {
   order?: string;
   basis?: 'accrual' | 'cash';
   includeBeforeStart?: string;
-  /** An instant, inclusive. */
+  /** A plain date, inclusive. */
   from?: string;
-  /** An instant, exclusive. */
+  /** A plain date, inclusive. */
   to?: string;
 }
 
@@ -60,8 +60,18 @@ export const FEED_MAX_PAGE_SIZE = 50000;
 const OWN_DOCUMENT_TABLES: Array<[string, string]> = [
   ['Bill', 'ext_trade_documents'],
   ['SaleInvoice', 'ext_trade_documents'],
+  ['VendorCredit', 'ext_trade_documents'],
+  ['CreditNote', 'ext_trade_documents'],
   ['BillPayment', 'ext_payments'],
   ['PaymentReceive', 'ext_payments'],
+];
+
+/** The kind of the lines of each of those documents that has lines. */
+const OWN_DOCUMENT_LINES: Array<[string, ExtRecordKind]> = [
+  ['Bill', ExtRecordKind.BillEntry],
+  ['SaleInvoice', ExtRecordKind.SaleInvoiceEntry],
+  ['VendorCredit', ExtRecordKind.VendorCreditEntry],
+  ['CreditNote', ExtRecordKind.CreditNoteEntry],
 ];
 
 /** A ledger line with what its entry is described by. */
@@ -113,7 +123,7 @@ export class LedgerEntriesService {
   }> {
     const { page, pageSize } = paging(query, FEED_MAX_PAGE_SIZE);
     const knex = this.tenantKnex();
-    const postedAt = this.ledgerRows.postedAt(knex);
+    const postedOn = this.ledgerRows.postedOn(knex);
     const direction =
       String(query.order).toLowerCase() === 'asc' ? 'asc' : 'desc';
     const range = await this.rangeOf(query);
@@ -121,21 +131,21 @@ export class LedgerEntriesService {
     const groups = () =>
       this.ledgerRows
         .applyRange(this.ledgerRows.rows(), range)
-        // One entry for each instant a document posts at: a payment of
-        // bills of two days is two entries.
-        .groupBy('t.reference_type', 't.reference_id', postedAt as any)
+        // One entry for each day a document posts on: a payment of bills
+        // of two days is two entries.
+        .groupBy('t.reference_type', 't.reference_id', postedOn as any)
         .select(
           't.reference_type as referenceType',
           't.reference_id as referenceId',
-          knex.raw('? as ??', [postedAt, 'postedAt']),
-          // Entries of one instant are listed in the order they were written.
+          knex.raw('? as ??', [postedOn, 'postedOn']),
+          // Entries of one day are listed in the order they were written.
           knex.raw('MIN(??) as ??', ['t.id', 'firstRowId']),
         );
     const [{ total }] = await knex.from(groups().as('g')).count({ total: '*' });
     const selected = await knex
       .from(groups().as('g'))
       .orderBy([
-        { column: 'postedAt', order: direction },
+        { column: 'postedOn', order: direction },
         { column: 'firstRowId', order: direction },
       ])
       .limit(pageSize)
@@ -170,7 +180,7 @@ export class LedgerEntriesService {
         ),
       );
       rows.forEach((row) => {
-        const key = `${referenceType}:${row.sourceId}:${row.postedAt}`;
+        const key = `${referenceType}:${row.sourceId}:${row.postedOn}`;
         const list = rowsByKey.get(key);
         if (list) list.push(row);
         else rowsByKey.set(key, [row]);
@@ -196,7 +206,7 @@ export class LedgerEntriesService {
     const data = selected.map((group: any) => {
       const entries =
         rowsByKey.get(
-          `${group.referenceType}:${Number(group.referenceId)}:${group.postedAt}`,
+          `${group.referenceType}:${Number(group.referenceId)}:${group.postedOn}`,
         ) ?? [];
       const own = ownById.get(
         `${group.referenceType}:${Number(group.referenceId)}`,
@@ -210,7 +220,7 @@ export class LedgerEntriesService {
         sourceId: Number(group.referenceId),
         number:
           journal?.journalNumber ?? own?.number ?? entries[0]?.number ?? null,
-        postedAt: group.postedAt,
+        postedOn: group.postedOn,
         description:
           journal?.description ??
           own?.note ??
@@ -252,7 +262,7 @@ export class LedgerEntriesService {
     const rows = await this.lineRows(
       scope()
         .orderBy([
-          { column: this.ledgerRows.postedAt(knex) as any, order: 'desc' },
+          { column: this.ledgerRows.postedOn(knex) as any, order: 'desc' },
           { column: 't.id', order: 'desc' },
         ])
         .limit(pageSize)
@@ -275,10 +285,10 @@ export class LedgerEntriesService {
 
     return {
       basis: query.basis ?? defaults.basis,
-      from: query.from ? toInstant(query.from) : null,
-      to: query.to ? toInstant(query.to) : null,
+      from: query.from ? toPlainDate(query.from) : null,
+      to: query.to ? toPlainDate(query.to) : null,
       notBefore:
-        query.includeBeforeStart === 'true' ? null : defaults.booksStartAt,
+        query.includeBeforeStart === 'true' ? null : defaults.booksStartOn,
     };
   }
 
@@ -304,6 +314,40 @@ export class LedgerEntriesService {
       described.set(
         `OpeningBalance:${Number(row.id)}`,
         `Opening balance for ${row.name ?? 'an account'}`,
+      ),
+    );
+    const fundings = await inChunks(
+      idsByType.get('RecordFunding') ?? [],
+      (run) =>
+        knex('ext_opening_balances as o')
+          .leftJoin('ext_fixed_assets as a', function joinAsset() {
+            this.on('a.id', '=', 'o.source_id').andOnVal(
+              'o.source',
+              '=',
+              'fixed_asset',
+            );
+          })
+          .leftJoin('ext_loans as l', function joinLoan() {
+            this.on('l.id', '=', 'o.source_id').andOnVal(
+              'o.source',
+              '=',
+              'loan',
+            );
+          })
+          .whereIn('o.id', run)
+          .select(
+            'o.id as id',
+            'o.source as source',
+            'a.name as assetName',
+            'l.name as loanName',
+          ),
+    );
+    fundings.forEach((row: any) =>
+      described.set(
+        `RecordFunding:${Number(row.id)}`,
+        row.source === 'loan'
+          ? `Proceeds of ${row.loanName ?? 'a loan'}`
+          : `Purchase of ${row.assetName ?? 'a fixed asset'}`,
       ),
     );
     const updates = await inChunks(
@@ -340,7 +384,7 @@ export class LedgerEntriesService {
       't.reference_number as reference',
       knex.raw('CAST(COALESCE(??, 0) AS CHAR) as ??', ['t.debit', 'debit']),
       knex.raw('CAST(COALESCE(??, 0) AS CHAR) as ??', ['t.credit', 'credit']),
-      knex.raw('? as ??', [this.ledgerRows.postedAt(knex), 'postedAt']),
+      knex.raw('? as ??', [this.ledgerRows.postedOn(knex), 'postedOn']),
     );
     if (rows.length === 0) return [];
 
@@ -359,14 +403,15 @@ export class LedgerEntriesService {
           .map((row: any) => Number(row.referenceId)),
       ),
     ];
-    const [nodes, journalLines, billLines, invoiceLines, trackingRows] =
+    const [nodes, journalLines, documentLines, trackingRows] =
       await Promise.all([
         this.tree.list(),
         this.lines.listMany(ExtRecordKind.ManualJournalEntry, journalIds),
-        this.lines.listMany(ExtRecordKind.BillEntry, idsOf('Bill')),
-        this.lines.listMany(
-          ExtRecordKind.SaleInvoiceEntry,
-          idsOf('SaleInvoice'),
+        Promise.all(
+          OWN_DOCUMENT_LINES.map(async ([referenceType, kind]) => ({
+            referenceType,
+            lines: await this.lines.listMany(kind, idsOf(referenceType)),
+          })),
         ),
         inChunks(rowIds, (run) =>
           knex('account_transaction_tracking_categories as l')
@@ -389,14 +434,11 @@ export class LedgerEntriesService {
         lineIdOf.set(`Journal:${journalId}:${line.index}`, line.id),
       ),
     );
-    billLines.forEach((lines, billId) =>
-      lines.forEach((line) =>
-        lineIdOf.set(`Bill:${billId}:${line.index}`, line.id),
-      ),
-    );
-    invoiceLines.forEach((lines, invoiceId) =>
-      lines.forEach((line) =>
-        lineIdOf.set(`SaleInvoice:${invoiceId}:${line.index}`, line.id),
+    documentLines.forEach(({ referenceType, lines: byDocument }) =>
+      byDocument.forEach((lines, documentId) =>
+        lines.forEach((line) =>
+          lineIdOf.set(`${referenceType}:${documentId}:${line.index}`, line.id),
+        ),
       ),
     );
     const nodeById = new Map(nodes.map((node) => [node.accountId, node]));
@@ -437,7 +479,7 @@ export class LedgerEntriesService {
         },
         debit: fromThousandths(toThousandths(String(row.debit))),
         credit: fromThousandths(toThousandths(String(row.credit))),
-        postedAt: row.postedAt,
+        postedOn: row.postedOn,
         tracking: trackingByRow.get(Number(row.id)) ?? [],
       };
     });

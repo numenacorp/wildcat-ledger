@@ -2,18 +2,19 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
+  IsBoolean,
   IsInt,
-  IsISO8601,
   IsNotEmpty,
   IsObject,
   IsOptional,
   IsString,
   Matches,
   MaxLength,
+  Min,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { StrictDto } from '@/common/decorators/StrictDto';
 import { EXTERNAL_ID_MAX_LENGTH } from '../LedgerExt.constants';
 import { LedgerTrackingDto } from '../ManualJournals/LedgerManualJournal.dto';
@@ -85,12 +86,30 @@ export class LedgerBillEntryDto {
 
 @StrictDto()
 export class LedgerBillDto {
+  @ApiProperty({
+    required: false,
+    description: 'On an edit: the version of the record the edit was made from',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+
   @ApiProperty({ required: false })
   @ValidateIf(present('externalId'))
   @IsString()
   @IsNotEmpty()
   @MaxLength(EXTERNAL_ID_MAX_LENGTH)
   externalId?: string | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'True for a document still open when the books began. It is dated on or before the day the books start, and posts its total against opening balance equity on that day',
+  })
+  @IsOptional()
+  @IsBoolean()
+  opening?: boolean;
 
   @ApiProperty({ required: false, description: 'The id of the vendor' })
   @ValidateIf(present('vendorId'))
@@ -109,13 +128,13 @@ export class LedgerBillDto {
   vendorExternalId?: string | null;
 
   @ApiProperty({ description: 'The instant the bill was received' })
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @IsString()
+  postedOn: string;
 
   @ApiProperty({ required: false })
-  @ValidateIf(present('dueAt'))
-  @IsISO8601({ strict: true })
-  dueAt?: string | null;
+  @ValidateIf(present('dueOn'))
+  @IsString()
+  dueOn?: string | null;
 
   @ApiProperty({
     required: false,
@@ -173,12 +192,12 @@ export class ListLedgerBillsQueryDto {
 
   @ApiProperty({ required: false, description: 'Received at or after' })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   from?: string;
 
   @ApiProperty({ required: false, description: 'Received at or before' })
   @IsOptional()
-  @IsISO8601({ strict: true })
+  @IsString()
   to?: string;
 
   @ApiProperty({ required: false })
@@ -190,6 +209,15 @@ export class ListLedgerBillsQueryDto {
   @IsOptional()
   @Matches(/^\d{1,9}$/)
   pageSize?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'With `true`, a list of bills also answers `credits`: what each vendor has left to apply, from credits and from payments',
+  })
+  @IsOptional()
+  @Matches(/^(true|false)$/)
+  withCredits?: string;
 }
 
 @StrictDto()
@@ -214,8 +242,8 @@ export class LedgerBillPaymentDto {
   externalId?: string | null;
 
   @ApiProperty({ description: 'The instant the money moved' })
-  @IsISO8601({ strict: true })
-  paidAt: string;
+  @IsString()
+  paidOn: string;
 
   @ApiProperty({ required: false, description: 'Kept as sent' })
   @ValidateIf(present('method'))
@@ -242,6 +270,15 @@ export class LedgerBillPaymentDto {
   @ValidateIf(present('accountId'))
   @IsInt()
   accountId?: number | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'The vendor what is left unapplied is a credit with. Without one it is the vendor of the bills paid, when they have one',
+  })
+  @ValidateIf(present('vendorId'))
+  @IsInt()
+  vendorId?: number | null;
 
   @ApiProperty({ required: false })
   @ValidateIf(present('reference'))
@@ -271,12 +308,30 @@ export class LedgerBillPaymentDto {
 
 @StrictDto()
 export class LedgerInvoiceDto {
+  @ApiProperty({
+    required: false,
+    description: 'On an edit: the version of the record the edit was made from',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+
   @ApiProperty({ required: false })
   @ValidateIf(present('externalId'))
   @IsString()
   @IsNotEmpty()
   @MaxLength(EXTERNAL_ID_MAX_LENGTH)
   externalId?: string | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'True for a document still open when the books began. It is dated on or before the day the books start, and posts its total against opening balance equity on that day',
+  })
+  @IsOptional()
+  @IsBoolean()
+  opening?: boolean;
 
   @ApiProperty({ required: false, description: 'The id of the customer' })
   @ValidateIf(present('customerId'))
@@ -294,13 +349,13 @@ export class LedgerInvoiceDto {
   customerExternalId?: string | null;
 
   @ApiProperty({ description: 'The instant the invoice was sent' })
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @IsString()
+  postedOn: string;
 
   @ApiProperty({ required: false })
-  @ValidateIf(present('dueAt'))
-  @IsISO8601({ strict: true })
-  dueAt?: string | null;
+  @ValidateIf(present('dueOn'))
+  @IsString()
+  dueOn?: string | null;
 
   @ApiProperty({
     required: false,
@@ -403,8 +458,8 @@ export class LedgerInvoicePaymentDto {
   customerId: number;
 
   @ApiProperty({ description: 'The instant the money moved' })
-  @IsISO8601({ strict: true })
-  paidAt: string;
+  @IsString()
+  paidOn: string;
 
   @ApiProperty({
     required: false,
@@ -468,4 +523,156 @@ export class LedgerInvoicePaymentDto {
   @ValidateNested({ each: true })
   @Type(() => LedgerInvoiceAllocationDto)
   allocations?: LedgerInvoiceAllocationDto[];
+}
+
+const CREDIT_STATUSES_PATTERN =
+  /^(open|partially_applied|applied|voided)(,(open|partially_applied|applied|voided))*$/;
+
+@StrictDto()
+export class ListLedgerVendorCreditsQueryDto extends OmitType(
+  ListLedgerBillsQueryDto,
+  ['status'] as const,
+) {
+  @ApiProperty({
+    required: false,
+    description: 'One status or several, separated by commas',
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(CREDIT_STATUSES_PATTERN)
+  status?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  vendorId?: string;
+}
+
+@StrictDto()
+export class ListLedgerCreditNotesQueryDto extends OmitType(
+  ListLedgerBillsQueryDto,
+  ['status'] as const,
+) {
+  @ApiProperty({
+    required: false,
+    description: 'One status or several, separated by commas',
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(CREDIT_STATUSES_PATTERN)
+  status?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  customerId?: string;
+}
+
+/** The payments of one side, oldest first. */
+@StrictDto()
+export class ListLedgerPaymentsQueryDto {
+  @ApiProperty({
+    required: false,
+    description: 'With `true`, only payments with money left unapplied',
+  })
+  @IsOptional()
+  @Matches(/^(true|false)$/)
+  unapplied?: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'The vendor the credit is with',
+  })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  vendorId?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  customerId?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  page?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @Matches(/^\d{1,9}$/)
+  pageSize?: string;
+}
+
+/** An amount of a payment or a credit, applied to a bill. */
+@StrictDto()
+export class LedgerBillApplicationDto {
+  @ApiProperty({ required: false })
+  @ValidateIf(present('externalId'))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(EXTERNAL_ID_MAX_LENGTH)
+  externalId?: string | null;
+
+  @ApiProperty({ description: 'The bill applied to' })
+  @IsInt()
+  billId: number;
+
+  @ApiProperty({ description: 'A decimal string, above zero' })
+  @IsString()
+  @Matches(MONEY_PATTERN)
+  amount: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'The version of the payment or credit applied',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+}
+
+/** An amount of a payment or a credit, applied to an invoice. */
+@StrictDto()
+export class LedgerInvoiceApplicationDto {
+  @ApiProperty({ required: false })
+  @ValidateIf(present('externalId'))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(EXTERNAL_ID_MAX_LENGTH)
+  externalId?: string | null;
+
+  @ApiProperty({ description: 'The invoice applied to' })
+  @IsInt()
+  invoiceId: number;
+
+  @ApiProperty({ description: 'A decimal string, above zero' })
+  @IsString()
+  @Matches(MONEY_PATTERN)
+  amount: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'The version of the payment or credit applied',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+}
+
+/** A customer credit note: an invoice's fields, with a number of its own. */
+@StrictDto()
+export class LedgerCreditNoteDto extends OmitType(LedgerInvoiceDto, [
+  'invoiceNumber',
+] as const) {
+  @ApiProperty({
+    required: false,
+    description: 'Kept as sent; one is issued when none is sent',
+  })
+  @ValidateIf(present('creditNoteNumber'))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(255)
+  creditNoteNumber?: string | null;
 }

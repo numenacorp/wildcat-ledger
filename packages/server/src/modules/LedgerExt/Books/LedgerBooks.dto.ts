@@ -2,6 +2,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsIn,
   IsInt,
   IsISO8601,
   IsNotEmpty,
@@ -37,16 +38,34 @@ const money = () => (target: object, key: string) => {
   Matches(MONEY_PATTERN)(target, key);
 };
 
+export const FUNDING_SOURCES = ['opening', 'account'] as const;
+export type FundingSource = (typeof FUNDING_SOURCES)[number];
+
+/**
+ * The entry a fixed asset or a loan is recorded with, and where its other
+ * side goes.
+ */
 @StrictDto()
-export class LedgerOpeningDto {
+export class LedgerFundingDto {
   @ApiProperty({ description: 'A decimal string' })
   @IsString()
   @Matches(MONEY_PATTERN)
   amount: string;
 
-  @ApiProperty({ description: 'The instant the opening entry is dated at' })
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @ApiProperty({ description: 'The instant the entry is dated at' })
+  @IsString()
+  postedOn: string;
+
+  @ApiProperty({
+    enum: FUNDING_SOURCES,
+    description:
+      '`account`: the other side goes to the account named, such as the bank account an asset was bought from or a loan was received into. `opening`: it was held when the books began, and the other side goes to opening balance equity; refused when dated after the day the books start.',
+  })
+  @IsIn(FUNDING_SOURCES as unknown as string[])
+  from: FundingSource;
+
+  @optional(IsInt())
+  accountId?: number | null;
 }
 
 @StrictDto()
@@ -86,12 +105,21 @@ export class CreateLedgerFixedAssetDto {
   @optional(IsObject())
   metadata?: Record<string, unknown> | null;
 
-  @optional(ValidateNested(), Type(() => LedgerOpeningDto))
-  opening?: LedgerOpeningDto | null;
+  @optional(ValidateNested(), Type(() => LedgerFundingDto))
+  funding?: LedgerFundingDto | null;
 }
 
 @StrictDto()
 export class EditLedgerFixedAssetDto {
+  @ApiProperty({
+    required: false,
+    description: 'The version of the asset the change was made from',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  version?: number;
+
   @ApiProperty({ required: false })
   @IsOptional()
   @IsString()
@@ -150,8 +178,8 @@ export class CreateLedgerValueUpdateDto {
   updateType: string;
 
   @ApiProperty()
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @IsString()
+  postedOn: string;
 
   @optional(IsString(), MaxLength(65535))
   note?: string | null;
@@ -195,8 +223,8 @@ export class CreateLedgerLoanDto {
   @optional(IsObject())
   metadata?: Record<string, unknown> | null;
 
-  @optional(ValidateNested(), Type(() => LedgerOpeningDto))
-  opening?: LedgerOpeningDto | null;
+  @optional(ValidateNested(), Type(() => LedgerFundingDto))
+  funding?: LedgerFundingDto | null;
 }
 
 @StrictDto()
@@ -221,8 +249,8 @@ export class LedgerOpeningBalanceRowDto {
 @StrictDto()
 export class ImportLedgerOpeningBalancesDto {
   @ApiProperty({ description: 'The instant every opening entry is dated at' })
-  @IsISO8601({ strict: true })
-  postedAt: string;
+  @IsString()
+  postedOn: string;
 
   @ApiProperty({ type: [LedgerOpeningBalanceRowDto] })
   @IsArray()

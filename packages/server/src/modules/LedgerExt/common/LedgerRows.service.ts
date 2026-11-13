@@ -13,16 +13,18 @@ export const REFERENCE_TYPE_KINDS: Record<string, ExtRecordKind> = {
   BillPayment: ExtRecordKind.BillPayment,
   SaleInvoice: ExtRecordKind.SaleInvoice,
   PaymentReceive: ExtRecordKind.PaymentReceived,
+  VendorCredit: ExtRecordKind.VendorCredit,
+  CreditNote: ExtRecordKind.CreditNote,
 };
 
 const POSTED_TABLE = 'ext_posted_accounts';
 
 export interface LedgerRange {
-  /** An instant, inclusive. */
+  /** A plain date, inclusive. */
   from?: string | null;
-  /** An instant, exclusive. */
+  /** A plain date, inclusive. */
   to?: string | null;
-  /** An instant: rows before it are left out, whatever `from` says. */
+  /** A plain date: rows before it are left out, whatever `from` says. */
   notBefore?: string | null;
   basis: 'accrual' | 'cash';
   /**
@@ -40,10 +42,8 @@ export interface AccountBalance {
 /**
  * Reads Bigcapital's ledger rows (`accounts_transactions`) for the extension.
  *
- * Bigcapital dates a ledger row by calendar day. The extension keeps the exact
- * instant of each document it creates, or of each row where a document posts
- * on more than one day, and ranges here are ranges of those instants. A row
- * the extension knows no instant for is placed at the start of its day.
+ * A ledger row is dated a calendar day, and ranges here are ranges of days,
+ * both ends included. Rows of one day keep the order they were written in.
  *
  * A row carries the basis it belongs to, or none when it counts on both.
  */
@@ -55,7 +55,7 @@ export class LedgerRowsService {
   ) {}
 
   /**
-   * The ledger rows joined to the instant of their document, as `posted_at`.
+   * The ledger rows, joined to the extension's row of their document.
    */
   public rows(trx?: Knex.Transaction): Knex.QueryBuilder {
     const knex = trx ?? this.tenantKnex();
@@ -63,8 +63,9 @@ export class LedgerRowsService {
       .map(([referenceType, kind]) => `WHEN '${referenceType}' THEN '${kind}'`)
       .join(' ');
 
-    return knex('accounts_transactions as t')
-      .leftJoin('ext_documents as d', function joinDocument() {
+    return knex('accounts_transactions as t').leftJoin(
+      'ext_documents as d',
+      function joinDocument() {
         this.on('d.record_id', '=', 't.reference_id').andOn(
           'd.kind',
           '=',
@@ -72,16 +73,13 @@ export class LedgerRowsService {
           // the way the connection maps table and column names.
           knex.raw(`CASE ?? ${kindCase} ELSE NULL END`, ['t.reference_type']),
         );
-      })
-      .leftJoin('ext_row_instants as r', 'r.account_transaction_id', 't.id');
+      },
+    );
   }
 
-  /** The SQL expression of a row's instant. */
-  public postedAt(knex: Knex | Knex.Transaction): Knex.Raw {
-    return knex.raw(
-      "COALESCE(??, ??, CONCAT(DATE_FORMAT(??, '%Y-%m-%d'), 'T00:00:00.000Z'))",
-      ['r.posted_at', 'd.transacted_at', 't.date'],
-    );
+  /** The SQL expression of the day a row is dated, as `YYYY-MM-DD`. */
+  public postedOn(knex: Knex | Knex.Transaction): Knex.Raw {
+    return knex.raw("DATE_FORMAT(??, '%Y-%m-%d')", ['t.date']);
   }
 
   public applyRange(
@@ -90,14 +88,14 @@ export class LedgerRowsService {
     trx?: Knex.Transaction,
   ): Knex.QueryBuilder {
     const knex = trx ?? this.tenantKnex();
-    const postedAt = this.postedAt(knex);
+    const postedOn = this.postedOn(knex);
 
     query.where(function basis() {
       this.whereNull('t.basis').orWhere('t.basis', range.basis);
     });
-    if (range.from) query.where(postedAt, '>=', range.from);
-    if (range.notBefore) query.where(postedAt, '>=', range.notBefore);
-    if (range.to) query.where(postedAt, '<', range.to);
+    if (range.from) query.where(postedOn, '>=', range.from);
+    if (range.notBefore) query.where(postedOn, '>=', range.notBefore);
+    if (range.to) query.where(postedOn, '<=', range.to);
     if (range.trackingOptionIds) {
       query.whereIn(
         't.id',

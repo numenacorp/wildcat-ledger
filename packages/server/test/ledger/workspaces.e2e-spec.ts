@@ -123,7 +123,7 @@ describe('Ledger extension: workspaces', () => {
     beforeAll(async () => {
       payload = body({
         reporting_basis: 'cash',
-        books_start_at: '2026-01-01T00:00:00-06:00',
+        books_start_on: '2026-01-01',
         accounts: chart(),
       });
       const res = await create(payload);
@@ -142,7 +142,9 @@ describe('Ledger extension: workspaces', () => {
         timezone: 'America/Chicago',
         reporting_basis: 'cash',
         // Midnight in Chicago in January is 06:00 UTC.
-        books_start_at: '2026-01-01T06:00:00.000Z',
+        books_start_on: '2026-01-01',
+        // The fiscal year starts in January unless the create says otherwise.
+        fiscal_year_start_month: 1,
         inactive_at: null,
         status: 'ready',
       });
@@ -299,11 +301,11 @@ describe('Ledger extension: workspaces', () => {
       const res = await http()
         .put(`/ledger/workspaces/${workspace.id}`)
         .set(user.headers())
-        .send({ books_start_at: '2025-07-01T00:00:00-05:00' })
+        .send({ books_start_on: '2025-07-01' })
         .expect(200);
       expect(res.body.data).toEqual({
         ...workspace,
-        books_start_at: '2025-07-01T05:00:00.000Z',
+        books_start_on: '2025-07-01',
       });
     });
 
@@ -349,7 +351,7 @@ describe('Ledger extension: workspaces', () => {
       expect(res.status).toBe(201);
       expect(res.body.data.status).toBe('ready');
       expect(res.body.data.reporting_basis).toBe('accrual');
-      expect(res.body.data.books_start_at).toBeNull();
+      expect(res.body.data.books_start_on).toBeNull();
 
       const tree = await rows(res.body.data, 'ext_account_tree');
       expect(tree).toHaveLength(SEEDED_ACCOUNTS);

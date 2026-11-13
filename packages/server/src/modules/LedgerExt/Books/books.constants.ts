@@ -8,6 +8,18 @@ export const BOOKS_ERRORS = {
   OPENING_BALANCES_ALREADY_IMPORTED: 'OPENING_BALANCES_ALREADY_IMPORTED',
   OPENING_ACCOUNT_NOT_FOUND: 'OPENING_ACCOUNT_NOT_FOUND',
   OPENING_ACCOUNT_NAMED_TWICE: 'OPENING_ACCOUNT_NAMED_TWICE',
+  /** Held "at the start of the books", yet dated after the day they start. */
+  OPENING_AFTER_BOOKS_START: 'OPENING_AFTER_BOOKS_START',
+  /**
+   * An imported opening balance names the receivable or the payable
+   * account. What was owed when the books began comes in as opening
+   * documents, one by one.
+   */
+  OPENING_CONTROL_ACCOUNT_ROW: 'OPENING_CONTROL_ACCOUNT_ROW',
+  /** Funded from an account with none named, or from the opening with one. */
+  FUNDING_ACCOUNT_REQUIRED: 'FUNDING_ACCOUNT_REQUIRED',
+  /** The other side may not go to that account. */
+  FUNDING_ACCOUNT_NOT_ALLOWED: 'FUNDING_ACCOUNT_NOT_ALLOWED',
 };
 
 /** The most rows one page of fixed assets, value updates or loans holds. */
@@ -19,6 +31,8 @@ export const OPENING_MAX_BALANCES = 5000;
 /** Bigcapital's names for the kinds of document these records post as. */
 export const OPENING_REFERENCE = 'OpeningBalance';
 export const VALUE_UPDATE_REFERENCE = 'FixedAssetValueUpdate';
+/** The entry of an asset bought from, or a loan received into, an account. */
+export const FUNDING_REFERENCE = 'RecordFunding';
 
 export const OPENING_EQUITY_SLUG = 'opening-balance-equity';
 

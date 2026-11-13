@@ -12,4 +12,8 @@ export const ACCOUNT_ERRORS = {
   ACCOUNT_HAS_CHILDREN: 'ACCOUNT_HAS_CHILDREN',
   ACCOUNT_PARENT_CIRCULAR: 'ACCOUNT_PARENT_CIRCULAR',
   ACCOUNT_TYPE_SINGLE: 'ACCOUNT_TYPE_SINGLE',
+  /** A type root groups accounts: it takes no posting, move, delete or archive. */
+  ACCOUNT_IS_TYPE_ROOT: 'ACCOUNT_IS_TYPE_ROOT',
+  /** An archived account takes no new line until it is restored. */
+  ACCOUNT_ARCHIVED: 'ACCOUNT_ARCHIVED',
 };

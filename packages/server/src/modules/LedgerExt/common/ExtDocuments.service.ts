@@ -8,8 +8,10 @@ const TABLE = 'ext_documents';
 export interface ExtDocument {
   kind: ExtRecordKind;
   recordId: number;
-  /** The exact instant of the document, as a UTC ISO-8601 string. */
-  transactedAt: string;
+  /** The day the document is dated, a plain date. */
+  transactedOn: string;
+  /** Raised by every change to the document. */
+  version: number;
   paymentMethod: string | null;
   reference: string | null;
   memo: string | null;
@@ -24,7 +26,7 @@ export interface ExtDocument {
 export type ExtDocumentAttributes = Partial<
   Pick<
     ExtDocument,
-    'transactedAt' | 'paymentMethod' | 'reference' | 'memo' | 'createdBy'
+    'transactedOn' | 'paymentMethod' | 'reference' | 'memo' | 'createdBy'
   >
 >;
 
@@ -129,7 +131,7 @@ export class ExtDocumentsService {
     const rows = await (trx ?? this.tenantKnex())(TABLE)
       .where({ kind })
       .whereNotNull('voidedAt')
-      .orderBy('transactedAt', 'desc');
+      .orderBy('transactedOn', 'desc');
     return rows.map((row) => this.toDocument(row));
   }
 
@@ -145,7 +147,8 @@ export class ExtDocumentsService {
     return {
       kind: row.kind,
       recordId: Number(row.recordId),
-      transactedAt: row.transactedAt ?? null,
+      transactedOn: row.transactedOn ?? null,
+      version: Number(row.version ?? 1),
       paymentMethod: row.paymentMethod ?? null,
       reference: row.reference ?? null,
       memo: row.memo ?? null,

@@ -17,10 +17,13 @@ import { ApiCommonHeaders } from '@/common/decorators/ApiCommonHeaders';
 import { OpaqueKeys } from '@/common/decorators/OpaqueKeys';
 import { LedgerWorkspaceGuard } from '../Workspaces/LedgerWorkspace.guard';
 import {
+  LedgerBillApplicationDto,
   LedgerBillDto,
   LedgerBillPaymentDto,
+  LedgerInvoiceApplicationDto,
   LedgerInvoiceDto,
   LedgerInvoicePaymentDto,
+  ListLedgerPaymentsQueryDto,
   ListLedgerBillsQueryDto,
   ListLedgerInvoicesQueryDto,
 } from './LedgerBill.dto';
@@ -30,10 +33,15 @@ import {
 } from './TradeDocuments.service';
 import { TradePaymentsService } from './TradePayments.service';
 import { LedgerInvoicePdfService } from './LedgerInvoicePdf.service';
-import { BILLS, INVOICES } from './trade.config';
+import { CreditApplicationsService } from './CreditApplications.service';
+import { BILLS, INVOICES, VENDOR_CREDITS } from './trade.config';
+import { DOCUMENT_LIST_MAX_PAGE_SIZE } from './trade.constants';
+import { created as answer, VersionDto } from '../common/Version.dto';
 import {
+  presentApplication,
   presentBill,
   presentBillPayment,
+  presentDocument,
   presentInvoice,
   presentInvoicePayment,
 } from './tradePresenters';
@@ -59,29 +67,72 @@ const invoiceInput = (dto: LedgerInvoiceDto): TradeDocumentInput => {
 @UseGuards(LedgerWorkspaceGuard)
 @OpaqueKeys('metadata')
 export class LedgerBillsController {
-  constructor(private readonly documents: TradeDocumentsService) {}
+  constructor(
+    private readonly documents: TradeDocumentsService,
+    private readonly payments: TradePaymentsService,
+  ) {}
 
   @Post()
   @ApiOperation({
-    summary: 'Create a bill, or replace the one carrying the external id',
+    summary:
+      'Create a bill. A repeat of an external id with the same body answers the bill; with another body it is refused',
   })
   async create(
     @Body() dto: LedgerBillDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { document, created } = await this.documents.create(
+    const { document, created, replayed } = await this.documents.create(
       BILLS,
       billInput(dto),
     );
     response.status(created ? 201 : 200);
-    return { data: presentBill(document) };
+    // A bill sent with a total below zero is answered as the vendor credit
+    // it was stored as.
+    return answer(presentDocument(BILLS, document), replayed);
   }
 
   @Get()
   @ApiOperation({ summary: 'List bills, oldest first' })
   async list(@Query() query: ListLedgerBillsQueryDto) {
-    const { data, pagination } = await this.documents.list(BILLS, query);
-    return { data: data.map(presentBill), pagination };
+    const { withCredits, ...rest } = query;
+    const { data, pagination } = await this.documents.list(BILLS, rest);
+    const page = { data: data.map(presentBill), pagination };
+
+    return withCredits === 'true'
+      ? { ...page, credits: await this.credits() }
+      : page;
+  }
+
+  /**
+   * What every vendor has left to apply, oldest first: each open vendor
+   * credit, then each bill payment with money left. With the open bills it
+   * is what payables are made of.
+   */
+  private async credits() {
+    const all = { page: 1, pageSize: DOCUMENT_LIST_MAX_PAGE_SIZE };
+    const [credits, payments] = await Promise.all([
+      this.documents.list(VENDOR_CREDITS, {
+        ...all,
+        status: 'open,partially_applied',
+      }),
+      this.payments.list(BILLS, { ...all, unapplied: 'true' }),
+    ]);
+    return [
+      ...credits.data.map((credit) => ({
+        kind: 'vendor_credit',
+        id: credit.id,
+        on: credit.postedOn,
+        unapplied: credit.balance,
+        vendor: credit.party,
+      })),
+      ...payments.data.map((payment) => ({
+        kind: 'bill_payment',
+        id: payment.id,
+        on: payment.paidOn,
+        unapplied: payment.unapplied,
+        vendor: payment.party,
+      })),
+    ];
   }
 
   @Get(':id')
@@ -103,8 +154,12 @@ export class LedgerBillsController {
   @Post(':id/void')
   @HttpCode(200)
   @ApiOperation({ summary: 'Void a bill' })
-  async void(@Param('id') id: string) {
-    return { data: presentBill(await this.documents.void(BILLS, Number(id))) };
+  async void(@Param('id') id: string, @Body() dto: VersionDto) {
+    return {
+      data: presentBill(
+        await this.documents.void(BILLS, Number(id), dto?.version),
+      ),
+    };
   }
 }
 
@@ -114,27 +169,66 @@ export class LedgerBillsController {
 @UseGuards(LedgerWorkspaceGuard)
 @OpaqueKeys('metadata')
 export class LedgerBillPaymentsController {
-  constructor(private readonly payments: TradePaymentsService) {}
+  constructor(
+    private readonly payments: TradePaymentsService,
+    private readonly applications: CreditApplicationsService,
+  ) {}
+
+  @Post(':id/applications')
+  @ApiOperation({
+    summary:
+      'Apply what a bill payment left unapplied to a bill of the same vendor',
+  })
+  async apply(
+    @Param('id') id: string,
+    @Body() dto: LedgerBillApplicationDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { billId, ...rest } = dto;
+    const { application, replayed } = await this.applications.apply(
+      { config: BILLS, id: Number(id) },
+      { ...rest, documentId: billId },
+      async () =>
+        presentBillPayment(await this.payments.get(BILLS, Number(id))),
+    );
+    response.status(replayed ? 200 : 201);
+    return answer(presentApplication(application), replayed);
+  }
 
   @Post()
   @ApiOperation({
     summary:
-      'Create a bill payment, or replace the one carrying the external id',
+      'Create a bill payment. A repeat of an external id with the same body answers the payment; with another body it is refused',
   })
   async create(
     @Body() dto: LedgerBillPaymentDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { allocations, ...rest } = dto;
-    const { payment, created } = await this.payments.create(BILLS, {
+    const { allocations, vendorId, ...rest } = dto;
+    const { payment, created, replayed } = await this.payments.create(BILLS, {
       ...rest,
+      partyId: vendorId,
       allocations: (allocations ?? []).map((a) => ({
         documentId: a.billId,
         amount: a.amount,
       })),
     });
     response.status(created ? 201 : 200);
-    return { data: presentBillPayment(payment) };
+    return answer(presentBillPayment(payment), replayed);
+  }
+
+  @Get()
+  @ApiOperation({
+    summary:
+      'List bill payments, oldest first; with unapplied=true, those with money left to apply',
+  })
+  async list(@Query() query: ListLedgerPaymentsQueryDto) {
+    const { vendorId, customerId: _customerId, ...rest } = query;
+    const { data, pagination } = await this.payments.list(BILLS, {
+      ...rest,
+      partyId: vendorId,
+    });
+    return { data: data.map(presentBillPayment), pagination };
   }
 
   @Get(':id')
@@ -147,9 +241,11 @@ export class LedgerBillPaymentsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete a bill payment' })
-  async delete(@Param('id') id: string) {
+  async delete(@Param('id') id: string, @Query('version') version?: string) {
     return {
-      data: presentBillPayment(await this.payments.delete(BILLS, Number(id))),
+      data: presentBillPayment(
+        await this.payments.delete(BILLS, Number(id), version),
+      ),
     };
   }
 }
@@ -173,18 +269,19 @@ export class LedgerInvoicesController {
 
   @Post()
   @ApiOperation({
-    summary: 'Create an invoice, or replace the one carrying the external id',
+    summary:
+      'Create an invoice. A repeat of an external id with the same body answers the invoice; with another body it is refused',
   })
   async create(
     @Body() dto: LedgerInvoiceDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const { document, created } = await this.documents.create(
+    const { document, created, replayed } = await this.documents.create(
       INVOICES,
       invoiceInput(dto),
     );
     response.status(created ? 201 : 200);
-    return { data: presentInvoice(document) };
+    return answer(presentInvoice(document), replayed);
   }
 
   @Get()
@@ -219,9 +316,11 @@ export class LedgerInvoicesController {
   @Post(':id/void')
   @HttpCode(200)
   @ApiOperation({ summary: 'Void an invoice' })
-  async void(@Param('id') id: string) {
+  async void(@Param('id') id: string, @Body() dto: VersionDto) {
     return {
-      data: presentInvoice(await this.documents.void(INVOICES, Number(id))),
+      data: presentInvoice(
+        await this.documents.void(INVOICES, Number(id), dto?.version),
+      ),
     };
   }
 }
@@ -232,30 +331,71 @@ export class LedgerInvoicesController {
 @UseGuards(LedgerWorkspaceGuard)
 @OpaqueKeys('metadata')
 export class LedgerInvoicePaymentsController {
-  constructor(private readonly payments: TradePaymentsService) {}
+  constructor(
+    private readonly payments: TradePaymentsService,
+    private readonly applications: CreditApplicationsService,
+  ) {}
+
+  @Post(':id/applications')
+  @ApiOperation({
+    summary:
+      'Apply what an invoice payment left unapplied to an invoice of the same customer',
+  })
+  async apply(
+    @Param('id') id: string,
+    @Body() dto: LedgerInvoiceApplicationDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const { invoiceId, ...rest } = dto;
+    const { application, replayed } = await this.applications.apply(
+      { config: INVOICES, id: Number(id) },
+      { ...rest, documentId: invoiceId },
+      async () =>
+        presentInvoicePayment(await this.payments.get(INVOICES, Number(id))),
+    );
+    response.status(replayed ? 200 : 201);
+    return answer(presentApplication(application), replayed);
+  }
 
   @Post()
   @ApiOperation({
     summary:
-      'Create an invoice payment, or replace the one carrying the external id',
+      'Create an invoice payment. A repeat of an external id with the same body answers the payment; with another body it is refused',
   })
   async create(
     @Body() dto: LedgerInvoicePaymentDto,
     @Res({ passthrough: true }) response: Response,
   ) {
     const { allocations, customerId, ...rest } = dto;
-    const { payment, created } = await this.payments.create(INVOICES, {
+    const { payment, created, replayed } = await this.payments.create(
+      INVOICES,
+      {
+        ...rest,
+        partyId: customerId,
+        allocations: (allocations ?? []).map((a) => ({
+          documentId: a.invoiceId ?? null,
+          accountId: a.accountId ?? null,
+          memo: a.memo ?? null,
+          amount: a.amount,
+        })),
+      },
+    );
+    response.status(created ? 201 : 200);
+    return answer(presentInvoicePayment(payment), replayed);
+  }
+
+  @Get()
+  @ApiOperation({
+    summary:
+      'List invoice payments, oldest first; with unapplied=true, those with money left to apply',
+  })
+  async list(@Query() query: ListLedgerPaymentsQueryDto) {
+    const { customerId, vendorId: _vendorId, ...rest } = query;
+    const { data, pagination } = await this.payments.list(INVOICES, {
       ...rest,
       partyId: customerId,
-      allocations: (allocations ?? []).map((a) => ({
-        documentId: a.invoiceId ?? null,
-        accountId: a.accountId ?? null,
-        memo: a.memo ?? null,
-        amount: a.amount,
-      })),
     });
-    response.status(created ? 201 : 200);
-    return { data: presentInvoicePayment(payment) };
+    return { data: data.map(presentInvoicePayment), pagination };
   }
 
   @Get(':id')
@@ -270,10 +410,10 @@ export class LedgerInvoicePaymentsController {
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete an invoice payment' })
-  async delete(@Param('id') id: string) {
+  async delete(@Param('id') id: string, @Query('version') version?: string) {
     return {
       data: presentInvoicePayment(
-        await this.payments.delete(INVOICES, Number(id)),
+        await this.payments.delete(INVOICES, Number(id), version),
       ),
     };
   }
